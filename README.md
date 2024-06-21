@@ -106,8 +106,6 @@ Use responsibly and only scan hosts you have permission to scan.
 - There is a redirection error on Windows systems that affects the accuracy of the scan results. This issue is being investigated.
 ## Future Plans:
 `--verbose` option will be added in future versions to provide more detailed output.
-License
-This project is licensed under the MIT License - see the LICENSE file for details.
 
 ## Acknowledgments
 This project is inspired by the Nmap network scanner.
