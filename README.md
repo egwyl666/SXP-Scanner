@@ -8,6 +8,17 @@ SXP Scanner is a lightweight, multi-threaded network scanner that supports SYN, 
 - **XMAS Scan**: Uses FIN, PSH, and URG flags to determine port state.
 - **ICMP Ping**: Sends ICMP Echo requests to check if a host is reachable.
 
+## Libraries Used
+
+This project uses the following Python standard libraries:
+
+- `socket`: For creating network connections and handling raw packets.
+- `struct`: For working with C-style data structures.
+- `binascii`: For binary to ASCII conversions.
+- `threading`: For multi-threading support.
+- `cmd`: For creating command-line interfaces.
+- `time`: For handling time-related tasks.
+
 ## Requirements
 
 - Python 3.x
