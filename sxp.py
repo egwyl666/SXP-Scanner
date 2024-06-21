@@ -105,7 +105,7 @@ def multi_scan(host, ports):
     ths = []
     for port in ports:
         th = threading.Thread(target=syn, args=(host, port))
-        ths.append(thread)
+        ths.append(th)
         th.start()
 
     for th in ths:
