@@ -134,7 +134,7 @@ def checksum_icmp(source_string):
 
 def create_icmp_packet(packet_id):
     header = struct.pack('!BBHHH', 8, 0, 0, packet_id, 1)
-    data = b'hello'
+    data = b'ilovermrf'
     my_checksum_icmp = checksum_icmp(header + data)
     header = struct.pack('!BBHHH', 8, 0, my_checksum_icmp, packet_id, 1)
     return header + data
