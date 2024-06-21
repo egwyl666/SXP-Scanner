@@ -108,7 +108,7 @@ def multi_scan(host, ports):
         ths.append(thread)
         th.start()
 
-    for thread in th:
+    for th in ths:
         th.join()
 
 def checksum_icmp(source_string):
