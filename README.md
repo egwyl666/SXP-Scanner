@@ -27,15 +27,10 @@ This project uses the following Python standard libraries:
 
 ## Installation
 
-1. Clone the repository:
+ Clone the repository:
     ```bash
     git clone https://github.com/yourusername/sxp-scanner.git
     cd sxp-scanner
-    ```
-
-2. Install required Python packages:
-    ```bash
-    pip install -r requirements.txt
     ```
 
 ## Usage
