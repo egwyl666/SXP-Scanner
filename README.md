@@ -103,7 +103,7 @@ Use responsibly and only scan hosts you have permission to scan.
 `--verbose` option will be added in future versions to provide more detailed output.
 
 ## Acknowledgments
-This project is inspired by the Nmap network scanner.
+This project is inspired by the Nmap network scanner and Ares.
 
 ## License
 This project is licensed under the MIT License. See the [LICENSE](https://github.com/egwyl666/SXP-Scanner/blob/main/LICENSE) file for details.
