@@ -1,109 +1,80 @@
 # SXP Scanner
 
-SXP Scanner is a lightweight, multi-threaded network scanner that supports SYN, XMAS, and ICMP Ping scans. This scanner is implemented in Python using built-in libraries and does not require additional dependencies such as `scapy`.
+SXP Scanner is a lightweight, multi-threaded network scanner that supports SYN, XMAS, TCP connect, and ICMP Ping scans. It is implemented in Python using only the standard library — no `scapy` or other dependencies.
 
 ## Features
 
-- **SYN Scan**: Checks if ports are open, closed, or filtered.
-- **XMAS Scan**: Uses FIN, PSH, and URG flags to determine port state.
-- **ICMP Ping**: Sends ICMP Echo requests to check if a host is reachable.
-
-## Libraries Used
-
-This project uses the following Python standard libraries:
-
-- `socket`: For creating network connections and handling raw packets.
-- `struct`: For working with C-style data structures.
-- `binascii`: For binary to ASCII conversions.
-- `threading`: For multi-threading support.
-- `cmd`: For creating command-line interfaces.
-- `time`: For handling time-related tasks.
+- **SYN Scan**: Raw half-open scan. A SYN/ACK reply means the port is open, RST means closed. Stealthier than a full connect and requires root.
+- **Connect Scan**: Full TCP `connect()` handshake. Needs no privileges, but is logged by the target.
+- **XMAS Scan**: Sends FIN + PSH + URG. A RST reply means closed; silence means open or filtered (per RFC 793).
+- **ICMP Ping**: Sends an ICMP Echo request and reports round-trip time.
+- Multi-threaded with a bounded thread pool, so large port ranges won't exhaust file descriptors.
+- `verbose` toggle to show closed/filtered ports in addition to open ones.
 
 ## Requirements
 
-- Python 3.x
-- Administrative privileges (required for sending raw packets)
-- Linux or Windows operating system
+- Python 3.6+
+- Root / Administrator privileges for the raw-socket scans (`syn`, `xmas`, `ping`). The `connect` scan runs without privileges.
+- Linux. On Windows, raw TCP sends are blocked by the OS since XP SP2, so `syn`/`xmas` will not work there without a packet driver such as Npcap.
 
 ## Installation
 
- Clone the repository:
-    ```bash
-    git clone https://github.com/yourusername/sxp-scanner.git
-    cd sxp-scanner
-    ```
-
-## Usage
-
-Run the scanner with administrative privileges:
+**One command** (installs `sxp` to `/usr/local/bin`):
 
 ```bash
-    sudo python3 sxp.py
+curl -fsSL https://raw.githubusercontent.com/egwyl666/SXP-Scanner/work/fixit1.0/install.sh | sudo bash
+```
+
+**Or from a clone:**
+
+```bash
+git clone -b work/fixit1.0 https://github.com/egwyl666/SXP-Scanner.git
+cd SXP-Scanner
+sudo ./install.sh
+```
+
+After installing, launch it from anywhere (the launcher re-execs under `sudo` automatically so raw sockets work):
+
+```bash
+sxp
+```
+
+To run without installing:
+
+```bash
+sudo python3 sxp.py
 ```
 
 ## Commands
 
-***Scan specific ports or a range of ports on a target host using the SYN scan method.***
+Ports can be given as a list, a range, or a mix:
 
-**Single or Multiple Ports in SYN:**
-
-```bash
-syn <host> <port1> <port2> ...
+```
+syn     scanme.nmap.org 22 80 443
+syn     scanme.nmap.org 20-25
+connect scanme.nmap.org 1-1024
+xmas    scanme.nmap.org 22 80 443
+ping    scanme.nmap.org
+verbose on        # also show closed/filtered ports
+exit
 ```
 
-```bash
-syn scanme.nmap.org 22 80 443
-```
-
-```bash
-syn <host> <start_port>-<end_port>
-```
-
-```bash
-syn scanme.nmap.org 20-25
-```
-
-**Single or Multiple Ports in XMAS:**
-
-```bash
-xmas <host> <port1> <port2> ...
-```
-
-
-```bash
-xmas scanme.nmap.org 22 80 443
-```
-
-```bash
-xmas <host> <start_port>-<end_port>
-```
-
-```bash
-xmas scanme.nmap.org 20-25
-```
-**ICMP Ping**
-
-  Ping a target host using ICMP Echo requests.
-
-
-```bash
-ping <host>
-```
-```bash
-ping scanme.nmap.org
-```
+| Command | What it does | Needs root |
+|---------|--------------|:----------:|
+| `syn <host> <ports>`     | Raw half-open SYN scan      | yes |
+| `connect <host> <ports>` | TCP connect scan            | no  |
+| `xmas <host> <ports>`    | FIN+PSH+URG scan            | yes |
+| `ping <host>`            | ICMP echo / RTT             | yes |
+| `verbose on\|off`        | Show all port states        | —   |
 
 ## Notes
-Ensure you have administrative privileges to run this scanner.
+
 Use responsibly and only scan hosts you have permission to scan.
 
-**Known Issue:** 
-- There is a redirection error on Windows systems that affects the accuracy of the scan results. This issue is being investigated.
-## Future Plans:
-`--verbose` option will be added in future versions to provide more detailed output.
-
 ## Acknowledgments
-This project is inspired by the Nmap network scanner and Ares.
+
+Inspired by the Nmap network scanner and Ares.
 
 ## License
-This project is licensed under the MIT License. See the [LICENSE](https://github.com/egwyl666/SXP-Scanner/blob/main/LICENSE) file for details.
+
+MIT. See [LICENSE](LICENSE).
