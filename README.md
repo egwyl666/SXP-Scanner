@@ -4,7 +4,8 @@ SXP Scanner is a lightweight, multi-threaded network scanner (SYN, XMAS, TCP con
 
 ## Features
 
-- **Targets**: every command accepts a host, `host:port`, or a full URL (`https://site.com:8443/path?a=1`). Domains are resolved to an IP, but the original hostname is kept for TLS SNI and the `Host` header.
+- **Targets**: every command accepts a host, `host:port`, a full URL (`https://site.com:8443/path?a=1`), a CIDR (`10.10.90.0/24`) or a last-octet range (`10.10.90.1-50`). Domains are resolved to an IP, but the original hostname is kept for TLS SNI and the `Host` header. `syn`/`connect`/`xmas` sweep a whole CIDR host-by-host.
+- **Host discovery** (`disco <cidr|range|host>`): a no-root TCP-connect ping sweep over a set of probe ports — a completed connect or a RST both mean the host is up — listing the live hosts in a subnet before a deeper scan.
 - **SYN Scan**: Raw half-open scan. SYN/ACK = open, RST = closed, **no reply = filtered** (a default-drop firewall). Ports are shuffled and silent ports get a second retransmit pass. Captures each reply's **per-port TTL** (`ttl=126 (win?, ~2 hops)`) for OS/hop estimation. Stealthy; requires root.
 - **Connect Scan**: Full TCP `connect()` handshake. Needs no privileges, but is logged by the target.
 - **XMAS Scan**: Sends FIN + PSH + URG. RST = closed; silence = open|filtered (per RFC 793).
@@ -80,7 +81,8 @@ exit
 
 | Command | What it does | Needs root |
 |---------|--------------|:----------:|
-| `syn <target> <ports>`     | Raw half-open SYN scan      | yes |
+| `disco <cidr\|range\|host>` | Host discovery / ping sweep | no  |
+| `syn <target> <ports>`     | Raw half-open SYN scan (CIDR ok) | yes |
 | `connect <target> <ports>` | TCP connect scan            | no  |
 | `xmas <target> <ports>`    | FIN+PSH+URG scan            | yes |
 | `fp <target> [ports]`      | Deep L7 fingerprint + unmasking | no |

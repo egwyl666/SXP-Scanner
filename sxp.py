@@ -1,5 +1,6 @@
 import cmd
 import hashlib
+import ipaddress
 import json
 import os
 import random
@@ -1067,6 +1068,94 @@ def host_intel(open_ports, fps, ttls=None, ping_ttl=None):
 
 
 # --------------------------------------------------------------------------- #
+# Multi-host targets + host discovery (ping sweep)                             #
+# --------------------------------------------------------------------------- #
+
+# Ports probed during host discovery (a TCP SYN/ACK or RST both mean "up").
+DISCO_PORTS = [80, 443, 22, 445, 3389, 8080, 8443, 3306, 53, 21, 25, 3000]
+MAX_SWEEP = 4096
+
+
+def expand_host_arg(token):
+    """Expand a CIDR or last-octet range into a list of IPs.
+
+    Returns (ips, error). ips is None when `token` is a single host/URL that
+    the normal parser should handle (with DNS)."""
+    t = token.strip()
+    if "://" in t:
+        return None, ""
+    if "/" in t:
+        try:
+            net = ipaddress.ip_network(t, strict=False)
+        except ValueError as e:
+            return None, f"bad CIDR: {e}"
+        hosts = [str(h) for h in net.hosts()] or [str(net.network_address)]
+        if len(hosts) > MAX_SWEEP:
+            return None, f"range too large ({len(hosts)} hosts, max {MAX_SWEEP})"
+        return hosts, ""
+    m = re.match(r"^(\d+\.\d+\.\d+)\.(\d+)-(\d+)$", t)
+    if m:
+        base, a, b = m.group(1), int(m.group(2)), int(m.group(3))
+        if not (0 <= a <= b <= 255):
+            return None, "bad address range"
+        return [f"{base}.{i}" for i in range(a, b + 1)], ""
+    return None, ""
+
+
+def _ip_key(ip):
+    try:
+        return tuple(int(x) for x in ip.split("."))
+    except ValueError:
+        return (0,)
+
+
+def tcp_ping(ip, ports, timeout):
+    """TCP-connect discovery: a completed connect OR a refusal means the host
+    is up. Returns (up, how)."""
+    for p in ports:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(timeout)
+                s.connect((ip, p))
+                return True, f"tcp/{p} open"
+        except ConnectionRefusedError:
+            return True, f"tcp/{p} closed (host replied RST)"
+        except (socket.timeout, OSError):
+            continue
+    return False, ""
+
+
+def discover_hosts(ips, ports, timeout=1.0):
+    live = {}
+    with ThreadPoolExecutor(max_workers=min(256, max(1, len(ips)))) as pool:
+        futures = {pool.submit(tcp_ping, ip, ports, timeout): ip for ip in ips}
+        for fut in as_completed(futures):
+            up, how = fut.result()
+            if up:
+                live[futures[fut]] = how
+    return live
+
+
+def run_disco(ips, ports):
+    print(f"Host discovery: {len(ips)} address(es), probe ports "
+          f"{','.join(map(str, ports))}")
+    start = time.time()
+    live = discover_hosts(ips, ports)
+    for ip in sorted(live, key=_ip_key):
+        print(f"  {GREEN}up{RESET}   {ip:<15}  ({live[ip]})")
+    elapsed = time.time() - start
+    print(f"{len(live)}/{len(ips)} hosts up in {elapsed:.2f}s")
+    return {
+        "type": "disco",
+        "probe_ports": ports,
+        "elapsed_s": round(elapsed, 3),
+        "hosts_up": [{"ip": ip, "via": live[ip]}
+                     for ip in sorted(live, key=_ip_key)],
+        "total": len(ips),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # SYN / XMAS / connect scanning (Block 4)                                      #
 # --------------------------------------------------------------------------- #
 
@@ -1771,7 +1860,8 @@ SXP Scanner 1.3 - scanning, service unmasking, WAF detection & host intel
 ================================================================================
 By: Egwyl666   GitHub: https://github.com/egwyl666
 ================================================================================
-Targets accept host, host:port or URL (https://site.com:8443/path).
+Targets accept host, host:port, URL, CIDR (10.0.0.0/24) or range (10.0.0.1-50).
+  disco <cidr|range|host>     host discovery / ping sweep (no root)
   syn <target> <ports>        raw half-open SYN scan      (root)
   connect <target> <ports>    TCP connect scan            (no root)
   xmas <target> <ports>       FIN+PSH+URG scan            (root)
@@ -1811,34 +1901,94 @@ Targets accept host, host:port or URL (https://site.com:8443/path).
             return None
         return spec
 
+    def _specs(self, arg, default_ports=None, need_ports=False):
+        """Return a list of TargetSpec, expanding CIDR / last-octet ranges."""
+        parts = arg.split()
+        if not parts:
+            print("Usage: <command> <target> [ports]")
+            return None
+        ips, err = expand_host_arg(parts[0])
+        if err:
+            print(err)
+            return None
+        if ips is None:                       # single host/URL -> normal parser
+            spec = self._target(arg, default_ports, need_ports)
+            return [spec] if spec else None
+        base = parse_target("0.0.0.0", port_args=parts[1:] or None,
+                            default_ports=default_ports)
+        if base.error:
+            print(base.error)
+            return None
+        if need_ports and not base.ports:
+            print("Specify port(s), e.g. 'syn 10.0.0.0/24 1-1024'")
+            return None
+        return [TargetSpec(host_input=ip, hostname=ip, ip=ip,
+                           ports=list(base.ports), path=base.path)
+                for ip in ips]
+
     # -- scans ------------------------------------------------------------- #
 
-    def do_syn(self, arg):
-        'Raw SYN scan: syn <target> <ports>   (needs root)'
-        spec = self._target(arg, need_ports=True)
-        if spec:
-            res = run_scan(spec, "syn", self.verbose, self.banner,
-                           self.ping_ttls.get(spec.ip))
+    def _run_scan_cmd(self, arg, scan_type):
+        specs = self._specs(arg, need_ports=True)
+        if not specs:
+            return
+        if len(specs) == 1:
+            res = run_scan(specs[0], scan_type, self.verbose, self.banner,
+                           self.ping_ttls.get(specs[0].ip))
             if res:
                 self.last_result = res
+            return
+        print(f"Scanning {len(specs)} hosts...\n")
+        host_results = []
+        for spec in specs:
+            res = run_scan(spec, scan_type, self.verbose, self.banner,
+                           self.ping_ttls.get(spec.ip))
+            if res:
+                # Only keep hosts that actually have open ports in the summary.
+                if any(p["state"] == "open" for p in res["ports"]):
+                    host_results.append(res)
+            print()
+        print(f"=== Sweep done: {len(host_results)}/{len(specs)} hosts "
+              f"with open ports ===")
+        self.last_result = {"type": f"{scan_type}-sweep",
+                            "hosts": host_results}
+
+    def do_syn(self, arg):
+        'Raw SYN scan: syn <target> <ports>   (target may be a CIDR; root)'
+        self._run_scan_cmd(arg, "syn")
 
     def do_connect(self, arg):
-        'TCP connect scan: connect <target> <ports>'
-        spec = self._target(arg, need_ports=True)
-        if spec:
-            res = run_scan(spec, "connect", self.verbose, self.banner,
-                           self.ping_ttls.get(spec.ip))
-            if res:
-                self.last_result = res
+        'TCP connect scan: connect <target> <ports>   (target may be a CIDR)'
+        self._run_scan_cmd(arg, "connect")
 
     def do_xmas(self, arg):
-        'XMAS scan: xmas <target> <ports>   (needs root)'
-        spec = self._target(arg, need_ports=True)
-        if spec:
-            res = run_scan(spec, "xmas", self.verbose, self.banner,
-                           self.ping_ttls.get(spec.ip))
-            if res:
-                self.last_result = res
+        'XMAS scan: xmas <target> <ports>   (target may be a CIDR; root)'
+        self._run_scan_cmd(arg, "xmas")
+
+    def do_disco(self, arg):
+        'Host discovery / ping sweep: disco <cidr|range|host> [probe-ports]'
+        parts = arg.split()
+        if not parts:
+            print("Usage: disco <cidr|range|host> [probe-ports]")
+            return
+        ips, err = expand_host_arg(parts[0])
+        if err:
+            print(err)
+            return
+        if ips is None:
+            spec = parse_target(parts[0])
+            if spec.error:
+                print(spec.error)
+                return
+            ips = [spec.ip]
+        ports = DISCO_PORTS
+        if len(parts) > 1:
+            try:
+                ports = parse_port_list(" ".join(parts[1:]))
+            except ValueError as e:
+                print(f"invalid port(s): {e}")
+                return
+        self.last_result = run_disco(ips, ports)
 
     def do_fp(self, arg):
         'Deep L7 fingerprint: fp <target> [ports]  (default 80,443,8080,8443)'
