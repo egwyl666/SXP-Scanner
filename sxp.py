@@ -1,28 +1,35 @@
 import cmd
 import hashlib
+import json
 import os
+import random
 import re
 import shutil
 import socket
 import ssl
+import string
 import struct
 import subprocess
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import List, Optional, Tuple
 
 RED = "\033[31m"
 GREEN = "\033[32m"
 BLUE = "\033[34m"
+YELLOW = "\033[33m"
 RESET = "\033[0m"
 
 MAX_WORKERS = 200
+SOCKET_TIMEOUT = 2.5
+READ_LIMIT = 16384
 
-VERSION = "1.2"
+VERSION = "1.3"
 # Where `update` pulls a fresh sxp.py from. Both are overridable via env
 # so a fork or a local mirror can be used for testing.
 UPDATE_BASE = os.environ.get(
@@ -30,6 +37,10 @@ UPDATE_BASE = os.environ.get(
     "https://raw.githubusercontent.com/egwyl666/SXP-Scanner")
 UPDATE_BRANCH = os.environ.get("SXP_BRANCH", "work/fixit1.0")
 UPDATE_URL = f"{UPDATE_BASE}/{UPDATE_BRANCH}/sxp.py"
+
+# A realistic browser User-Agent so servers/WAFs behave as they would for one.
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
 LOGO = RED + r"""
 ███████╗██╗  ██╗██████╗
@@ -40,6 +51,10 @@ LOGO = RED + r"""
 ╚══════╝╚═╝  ╚═╝╚═╝     """ + RESET
 
 
+# --------------------------------------------------------------------------- #
+# Low-level networking (checksums, raw headers, source IP)                    #
+# --------------------------------------------------------------------------- #
+
 def checksum(source_string):
     """Standard 16-bit one's-complement Internet checksum (RFC 1071)."""
     total = 0
@@ -49,10 +64,8 @@ def checksum(source_string):
         this_val = source_string[count + 1] * 256 + source_string[count]
         total = (total + this_val) & 0xffffffff
         count += 2
-
     if count_to < len(source_string):
         total = (total + source_string[-1]) & 0xffffffff
-
     total = (total >> 16) + (total & 0xffff)
     total += (total >> 16)
     answer = ~total & 0xffff
@@ -61,10 +74,7 @@ def checksum(source_string):
 
 
 def get_source_ip(target_ip):
-    """Find the local address the kernel would use to reach target_ip.
-
-    No packet is sent: connecting a UDP socket only sets the route.
-    """
+    """Local address the kernel would use to reach target_ip (no packet sent)."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect((target_ip, 80))
@@ -73,6 +83,14 @@ def get_source_ip(target_ip):
         return "127.0.0.1"
     finally:
         s.close()
+
+
+def _is_ip(value):
+    try:
+        socket.inet_aton(value)
+        return value.count(".") == 3
+    except (OSError, AttributeError):
+        return False
 
 
 def service_name(port):
@@ -86,109 +104,131 @@ def service_name(port):
 
 
 # --------------------------------------------------------------------------- #
-# Service fingerprinting / unmasking                                          #
+# Target parsing (Block 1)                                                     #
 # --------------------------------------------------------------------------- #
 
-# Ports assumed to speak TLS from the first byte.
-TLS_PORTS = {443, 8443, 9443, 4443}
-# Plaintext HTTP ports where an empty reply is normal (no TLS fallback).
-PLAINTEXT_HTTP_PORTS = {80, 81, 591, 8000, 8008, 8080, 8081, 8888}
-# Server headers commonly spoofed; seeing one is worth an error-page probe.
-SPOOF_PRONE = {"cloudflare", "apache", "iis", "microsoft-iis", "gws",
-               "openresty"}
-# Issuer names that legitimately appear in front of public CDNs / sites.
-PUBLIC_CA_HINTS = ("cloudflare", "google trust", "digicert", "lets encrypt",
-                   "let's encrypt", "amazon", "sectigo", "globalsign",
-                   "baltimore", "isrg")
-SOCKET_TIMEOUT = 2.5
-READ_LIMIT = 8192
-
-# Default error-page body signatures admins often forget to mask.
-_BODY_SIGS = [
-    ("nginx", "<center>nginx</center>"),
-    ("openresty", "openresty"),
-    ("apache", "<address>apache"),
-    ("apache", "apache/"),
-    ("iis", "microsoft-iis"),
-    ("litespeed", "litespeed"),
-    ("caddy", "caddy"),
-]
-
-
 @dataclass
-class CertInfo:
-    subject_cn: str = ""
-    subject_o: str = ""
-    issuer_cn: str = ""
-    issuer_o: str = ""
-    san: List[str] = field(default_factory=list)
-    not_before: str = ""
-    not_after: str = ""
-    self_signed: bool = False
-    source: str = ""           # how the cert was decoded
-
-    def one_line(self):
-        issuer = self.issuer_o or self.issuer_cn or "?"
-        tag = " (self-signed)" if self.self_signed else ""
-        return f"CN={self.subject_cn or '?'} | Issuer={issuer}{tag}"
-
-
-@dataclass
-class Evidence:
-    weight: int
-    description: str
-    inferred_service: str = ""
-
-
-@dataclass
-class Fingerprint:
-    port: int
-    transport: str = "TCP"          # "TCP" or a TLS version string
-    tls_version: str = ""
-    cipher: str = ""
-    cert: Optional[CertInfo] = None
-    http_status: str = ""
-    title: str = ""
-    server_header: str = ""
-    headers_raw: List[Tuple[str, str]] = field(default_factory=list)
-    headers_lower: dict = field(default_factory=dict)
-    body_snippet: str = ""
-    raw_banner: str = ""            # non-HTTP services (SSH, FTP, SMTP, ...)
-    evidence: List[Evidence] = field(default_factory=list)
-    inferred_service: str = ""
-    spoofed: bool = False
+class TargetSpec:
+    host_input: str
+    hostname: str = ""
+    ip: str = ""
+    scheme: str = ""
+    ports: List[int] = field(default_factory=list)
+    path: str = "/"
     error: str = ""
 
 
-# --- transport helpers ----------------------------------------------------- #
+def parse_port_list(text):
+    """'80,443,8080' or '20-25 80' -> sorted unique valid ports."""
+    ports = set()
+    for token in re.split(r"[,\s]+", text.strip()):
+        if not token:
+            continue
+        if "-" in token:
+            a, _, b = token.partition("-")
+            start, end = int(a), int(b)
+            if start > end:
+                start, end = end, start
+            ports.update(range(start, end + 1))
+        else:
+            ports.add(int(token))
+    for p in ports:
+        if not 0 < p < 65536:
+            raise ValueError(f"port out of range: {p}")
+    return sorted(ports)
+
+
+def parse_target(raw_target, port_args=None, default_ports=None):
+    """Parse site.com / 10.0.0.1 / site.com:8443 / https://site.com:8443/p?x=1.
+
+    Resolves the IP but keeps the original hostname for TLS SNI and the Host
+    header. Port precedence: explicit port_args > :port in target >
+    scheme default (https->443, http->80) > default_ports > [].
+    """
+    raw = raw_target.strip()
+    if "://" in raw:
+        parts = urllib.parse.urlsplit(raw)
+    else:
+        parts = urllib.parse.urlsplit("//" + raw)
+
+    scheme = parts.scheme.lower()
+    hostname = parts.hostname or ""
+    if not hostname:
+        return TargetSpec(host_input=raw, error="could not parse a hostname")
+
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+
+    # Determine ports.
+    ports = []
+    if port_args:
+        joined = port_args if isinstance(port_args, str) else " ".join(port_args)
+        try:
+            ports = parse_port_list(joined)
+        except ValueError as e:
+            return TargetSpec(host_input=raw, hostname=hostname,
+                              error=f"invalid port(s): {e}")
+    elif parts.port:
+        ports = [parts.port]
+    elif scheme == "https":
+        ports = [443]
+    elif scheme == "http":
+        ports = [80]
+    elif default_ports:
+        ports = list(default_ports)
+
+    spec = TargetSpec(host_input=raw, hostname=hostname, scheme=scheme,
+                      ports=ports, path=path)
+
+    # Resolve IP (keep hostname for SNI/Host).
+    if _is_ip(hostname):
+        spec.ip = hostname
+    else:
+        try:
+            spec.ip = socket.gethostbyname(hostname)
+        except socket.gaierror as e:
+            spec.error = f"cannot resolve {hostname}: {e}"
+    return spec
+
+
+# --------------------------------------------------------------------------- #
+# TLS / socket transport                                                       #
+# --------------------------------------------------------------------------- #
 
 def _tls_context():
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    # Accept legacy/odd servers too; we only want to read, not to trust.
     try:
         ctx.set_ciphers("ALL:@SECLEVEL=0")
     except ssl.SSLError:
         pass
+    try:
+        ctx.set_alpn_protocols(["h2", "http/1.1"])
+    except (NotImplementedError, AttributeError):
+        pass
     return ctx
 
 
-def _open_socket(host, port, use_tls, timeout=SOCKET_TIMEOUT):
-    raw = socket.create_connection((host, port), timeout=timeout)
+def _open_socket(ip, port, use_tls, timeout=SOCKET_TIMEOUT, server_hostname=None):
+    """Open a TCP (and optionally TLS) socket. SNI uses server_hostname when
+    it is a real name, never a bare IP."""
+    raw = socket.create_connection((ip, port), timeout=timeout)
     raw.settimeout(timeout)
     if not use_tls:
         return raw
     ctx = _tls_context()
+    sni = server_hostname if (server_hostname and not _is_ip(server_hostname)) else None
     try:
-        return ctx.wrap_socket(raw, server_hostname=host)
+        return ctx.wrap_socket(raw, server_hostname=sni)
     except (ssl.SSLError, ValueError, OSError):
         try:
             raw.close()
         except OSError:
             pass
-        # Retry without SNI (e.g. host is a bare IP address).
-        raw2 = socket.create_connection((host, port), timeout=timeout)
+        # Retry once without SNI (some servers reject SNI, or host is an IP).
+        raw2 = socket.create_connection((ip, port), timeout=timeout)
         raw2.settimeout(timeout)
         try:
             return ctx.wrap_socket(raw2)
@@ -215,73 +255,282 @@ def _recv_all(sock, limit=READ_LIMIT):
 
 
 def _looks_like_tls(data):
-    # TLS record header: 0x16 handshake / 0x15 alert, then 0x03 version byte.
+    # TLS record header: 0x16 handshake / 0x15 alert, then a 0x03 version byte.
     return len(data) >= 2 and data[0] in (0x15, 0x16) and data[1] == 0x03
 
 
-# --- HTTP helpers ----------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# HTTP engine (Block 2)                                                        #
+# --------------------------------------------------------------------------- #
 
-def _http_get(host):
-    return (
-        "GET / HTTP/1.1\r\n"
-        f"Host: {host}\r\n"
-        "User-Agent: Mozilla/5.0 (compatible; SXP-Scanner/1.2)\r\n"
-        "Accept: */*\r\n"
-        "Connection: close\r\n\r\n"
-    ).encode()
+@dataclass
+class HttpResp:
+    status: str = ""
+    code: int = 0
+    server: str = ""
+    headers_raw: List[Tuple[str, str]] = field(default_factory=list)
+    headers_lower: dict = field(default_factory=dict)
+    cookies: List[str] = field(default_factory=list)
+    location: str = ""
+    body: str = ""
+    length: int = 0
+    title: str = ""
+    rtt_ms: float = 0.0
+    transport: str = "TCP"
+    alpn: str = ""
+    tls_version: str = ""
+    cipher: str = ""
+    cert: Optional["CertInfo"] = None
+    raw_banner: str = ""
+    error: str = ""
 
 
-def _http_bad():
-    # Empty Host makes nginx and friends answer with their native 400 page.
-    return b"GET / HTTP/1.1\r\nHost: \r\n\r\n"
+def _host_header(hostname, port, use_tls):
+    standard = (use_tls and port == 443) or (not use_tls and port == 80)
+    return hostname if standard else f"{hostname}:{port}"
 
 
-def _parse_http(data):
-    """Parse an HTTP response, or return None if `data` is not one."""
+def _build_request(hostname, port, use_tls, path, method, http10,
+                   extra_headers, send_host):
+    version = "HTTP/1.0" if http10 else "HTTP/1.1"
+    lines = [f"{method} {path} {version}"]
+    if send_host:
+        lines.append(f"Host: {_host_header(hostname, port, use_tls)}")
+    lines.append(f"User-Agent: {BROWSER_UA}")
+    lines.append("Accept: text/html,application/xhtml+xml,application/xml;"
+                 "q=0.9,*/*;q=0.8")
+    lines.append("Accept-Encoding: identity")
+    for k, v in (extra_headers or {}).items():
+        lines.append(f"{k}: {v}")
+    lines += ["Connection: close", "", ""]
+    return "\r\n".join(lines).encode("latin-1", "replace")
+
+
+def _dechunk(body):
+    """Decode a Transfer-Encoding: chunked body into plain bytes."""
+    out = bytearray()
+    i, n = 0, len(body)
+    while i < n:
+        j = body.find(b"\r\n", i)
+        if j == -1:
+            break
+        try:
+            size = int(body[i:j].split(b";")[0].strip(), 16)
+        except ValueError:
+            break
+        if size == 0:
+            break
+        start = j + 2
+        out += body[start:start + size]
+        i = start + size + 2          # skip the chunk's trailing CRLF
+    return bytes(out)
+
+
+def _fill_http(resp, data):
     if not data[:5].upper().startswith(b"HTTP/"):
-        return None
+        if data:
+            first = data.decode("latin-1", "replace").splitlines()
+            resp.raw_banner = (first[0][:120] if first else "")
+        if not resp.error:
+            resp.error = "non-HTTP response"
+        return
     head, _, body = data.partition(b"\r\n\r\n")
     lines = head.split(b"\r\n")
-    status_line = lines[0].decode("latin-1", "replace").strip()
-    headers_raw = []
-    headers_lower = {}
+    resp.status = lines[0].decode("latin-1", "replace").strip()
+    resp.code = _status_code(resp.status)
     for ln in lines[1:]:
         if b":" not in ln:
             continue
         k, _, v = ln.partition(b":")
         key = k.decode("latin-1", "replace").strip()
         val = v.decode("latin-1", "replace").strip()
-        headers_raw.append((key, val))
-        headers_lower[key.lower()] = val
-    body_text = body[:2048].decode("latin-1", "replace")
+        resp.headers_raw.append((key, val))
+        low = key.lower()
+        resp.headers_lower[low] = val
+        if low == "set-cookie":
+            resp.cookies.append(val)
+        elif low == "location":
+            resp.location = val
+    resp.server = resp.headers_lower.get("server", "")
+    if "chunked" in resp.headers_lower.get("transfer-encoding", "").lower():
+        body = _dechunk(body)
+    resp.length = len(body)
+    body_text = body[:4096].decode("latin-1", "replace")
+    resp.body = body_text
     m = re.search(r"<title[^>]*>(.*?)</title>", body_text,
                   re.IGNORECASE | re.DOTALL)
-    title = re.sub(r"\s+", " ", m.group(1)).strip()[:120] if m else ""
-    return status_line, headers_raw, headers_lower, body_text, title
+    resp.title = re.sub(r"\s+", " ", m.group(1)).strip()[:120] if m else ""
 
 
-def _engine_from_body(body):
-    """Identify a web engine from body signatures: (engine, matched_sig)."""
-    if not body:
-        return "", ""
-    low = body.lower()
-    for engine, sig in _BODY_SIGS:
-        if sig in low:
-            return engine, sig
-    return "", ""
+def http_request(ip, port, use_tls, hostname, path="/", method="GET",
+                 http10=False, extra_headers=None, send_host=True,
+                 timeout=SOCKET_TIMEOUT):
+    """One HTTP(S) request. Always returns an HttpResp (error set on failure)."""
+    resp = HttpResp(transport="TCP")
+    t0 = time.time()
+    try:
+        sock = _open_socket(ip, port, use_tls, timeout, server_hostname=hostname)
+    except OSError as e:
+        resp.error = str(e)
+        resp.rtt_ms = (time.time() - t0) * 1000
+        return resp
+    try:
+        if use_tls:
+            resp.transport = sock.version() or "TLS"
+            resp.tls_version = resp.transport
+            c = sock.cipher()
+            resp.cipher = c[0] if c else ""
+            try:
+                resp.alpn = sock.selected_alpn_protocol() or ""
+            except Exception:                              # noqa: BLE001
+                resp.alpn = ""
+            resp.cert = extract_cert_info(sock)
+        req = _build_request(hostname, port, use_tls, path, method,
+                             http10, extra_headers, send_host)
+        sock.sendall(req)
+        data = _recv_all(sock)
+    except OSError as e:
+        resp.error = str(e)
+        resp.rtt_ms = (time.time() - t0) * 1000
+        return resp
+    finally:
+        sock.close()
+    resp.rtt_ms = (time.time() - t0) * 1000
+    _fill_http(resp, data)
+    return resp
 
 
-def _family(server_header):
-    """First token of a Server header, lowercased: 'nginx/1.18' -> 'nginx'."""
-    if not server_header or not server_header.strip():
-        return ""
-    return server_header.split("/")[0].split()[0].strip().lower()
+def _status_code(status_line):
+    parts = status_line.split()
+    if len(parts) >= 2 and parts[1].isdigit():
+        return int(parts[1])
+    return 0
 
 
-# --- TLS certificate extraction (stdlib hack + fallbacks) ------------------- #
+def _parse_location(loc, cur, orig_hostname, orig_ip):
+    """Resolve a Location header relative to the current request.
+
+    Returns a dict {ip, port, use_tls, hostname, path} to follow, or None to
+    stop (cross-host redirect or unparseable)."""
+    parts = urllib.parse.urlsplit(loc)
+    if parts.scheme or parts.netloc:
+        host = parts.hostname or ""
+        if host and host.lower() not in (orig_hostname.lower(), orig_ip):
+            return None                                    # cross-host: stop
+        use_tls = parts.scheme.lower() == "https"
+        port = parts.port or (443 if use_tls else 80)
+        path = parts.path or "/"
+        if parts.query:
+            path += "?" + parts.query
+        return {"ip": orig_ip, "port": port, "use_tls": use_tls,
+                "hostname": host or orig_hostname, "path": path}
+    # Relative path on the same endpoint.
+    path = loc if loc.startswith("/") else "/" + loc
+    return {"ip": orig_ip, "port": cur["port"], "use_tls": cur["use_tls"],
+            "hostname": cur["hostname"], "path": path}
+
+
+def fetch_follow(ip, port, use_tls, hostname, path, timeout, max_hops=2):
+    """GET a URL, following up to max_hops same-host redirects.
+
+    Returns (final_resp, redirect_chain) where the chain is a list of
+    (code, location) tuples for each hop taken."""
+    chain = []
+    cur = {"ip": ip, "port": port, "use_tls": use_tls,
+           "hostname": hostname, "path": path}
+    resp = http_request(ip, port, use_tls, hostname, path, timeout=timeout)
+    hops = 0
+    while (resp.code in (301, 302, 303, 307, 308) and resp.location
+           and hops < max_hops):
+        chain.append((resp.code, resp.location))
+        nxt = _parse_location(resp.location, cur, hostname, ip)
+        if nxt is None:
+            break
+        resp = http_request(nxt["ip"], nxt["port"], nxt["use_tls"],
+                            nxt["hostname"], nxt["path"], timeout=timeout)
+        cur = nxt
+        hops += 1
+    return resp, chain
+
+
+# --------------------------------------------------------------------------- #
+# Service fingerprinting / unmasking (Block 2 + 5)                            #
+# --------------------------------------------------------------------------- #
+
+TLS_PORTS = {443, 8443, 9443, 4443, 2053, 2083, 2087, 2096}
+PLAINTEXT_HTTP_PORTS = {80, 81, 591, 8000, 8008, 8080, 8081, 8888, 2052, 2082,
+                        2086, 2095, 8880}
+SPOOF_PRONE = {"cloudflare", "apache", "iis", "microsoft-iis", "gws",
+               "openresty"}
+PUBLIC_CA_HINTS = ("cloudflare", "google trust", "digicert", "lets encrypt",
+                   "let's encrypt", "amazon", "sectigo", "globalsign",
+                   "baltimore", "isrg")
+
+_BODY_SIGS = [
+    ("nginx", "<center>nginx</center>"),
+    ("openresty", "openresty"),
+    ("apache", "<address>apache"),
+    ("apache", "apache/"),
+    ("iis", "microsoft-iis"),
+    ("litespeed", "litespeed"),
+    ("caddy", "caddy"),
+    ("tomcat", "apache tomcat"),
+    ("starlette", "internal server error"),  # weak, only as last resort
+]
+
+
+@dataclass
+class CertInfo:
+    subject_cn: str = ""
+    subject_o: str = ""
+    issuer_cn: str = ""
+    issuer_o: str = ""
+    san: List[str] = field(default_factory=list)
+    not_before: str = ""
+    not_after: str = ""
+    self_signed: bool = False
+    source: str = ""
+
+    def one_line(self):
+        issuer = self.issuer_o or self.issuer_cn or "?"
+        tag = " (self-signed)" if self.self_signed else ""
+        return f"CN={self.subject_cn or '?'} | Issuer={issuer}{tag}"
+
+
+@dataclass
+class Evidence:
+    weight: int
+    description: str
+    inferred_service: str = ""
+
+
+@dataclass
+class Fingerprint:
+    port: int
+    transport: str = "TCP"
+    tls_version: str = ""
+    cipher: str = ""
+    alpn: str = ""
+    cert: Optional[CertInfo] = None
+    http_status: str = ""
+    title: str = ""
+    server_header: str = ""
+    headers_raw: List[Tuple[str, str]] = field(default_factory=list)
+    headers_lower: dict = field(default_factory=dict)
+    body_snippet: str = ""
+    raw_banner: str = ""
+    redirect_chain: List[Tuple[int, str]] = field(default_factory=list)
+    notfound_status: str = ""
+    allow: str = ""
+    evidence: List[Evidence] = field(default_factory=list)
+    inferred_service: str = ""
+    spoofed: bool = False
+    error: str = ""
+
+
+# --- certificate extraction (stdlib hack + fallbacks) ----------------------- #
 
 def _name_field(name_seq, key):
-    """Pull a value from the ((('commonName','x'),),...) RDN structure."""
     for rdn in name_seq or ():
         for attr in rdn:
             if attr[0] == key:
@@ -353,10 +602,9 @@ def _cert_via_openssl(pem):
 
 
 def _cert_via_der_scan(der):
-    """Last-resort: pull commonName strings straight out of the DER bytes."""
     ci = CertInfo(source="der-scan")
     cns = []
-    marker = b"\x06\x03\x55\x04\x03"   # OID 2.5.4.3 = commonName
+    marker = b"\x06\x03\x55\x04\x03"
     i = 0
     while True:
         j = der.find(marker, i)
@@ -377,7 +625,6 @@ def _cert_via_der_scan(der):
 
 
 def extract_cert_info(sslsock):
-    """Decode the peer certificate even when verification is disabled."""
     try:
         der = sslsock.getpeercert(binary_form=True)
     except (ssl.SSLError, OSError):
@@ -396,7 +643,6 @@ def extract_cert_info(sslsock):
 
 
 def _cert_validity_days(cert):
-    """Lifetime of the cert in days, or None if the dates can't be parsed."""
     if not cert.not_before or not cert.not_after:
         return None
     try:
@@ -408,7 +654,6 @@ def _cert_validity_days(cert):
 
 
 def _cert_is_private(cert):
-    """True if the cert is self-signed or from a non-public / internal CA."""
     if cert.self_signed:
         return True
     issuer = f"{cert.issuer_o} {cert.issuer_cn}".lower().strip()
@@ -417,14 +662,45 @@ def _cert_is_private(cert):
     return not any(h in issuer for h in PUBLIC_CA_HINTS)
 
 
-# --- probe pipeline --------------------------------------------------------- #
+# --- helpers ---------------------------------------------------------------- #
+
+def _http_get_probe(host):
+    return (
+        "GET / HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        f"User-Agent: {BROWSER_UA}\r\n"
+        "Accept: */*\r\nConnection: close\r\n\r\n"
+    ).encode()
+
+
+def _engine_from_body(body):
+    if not body:
+        return "", ""
+    low = body.lower()
+    for engine, sig in _BODY_SIGS:
+        if sig in low:
+            return engine, sig
+    return "", ""
+
+
+def _family(server_header):
+    if not server_header or not server_header.strip():
+        return ""
+    return server_header.split("/")[0].split()[0].strip().lower()
+
+
+def _rand_path():
+    return "/sxp_" + "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+
+
+# --- transport decision + probe pipeline ------------------------------------ #
 
 def _plaintext_probe(host, port, timeout):
-    """Returns (http_bytes, greeting_or_None, tls_hint, marker)."""
+    """Returns (http_bytes, greeting_or_None, tls_hint, nginx_https)."""
     try:
         sock = _open_socket(host, port, False, timeout)
     except OSError:
-        return b"", None, False, ""
+        return b"", None, False, False
     try:
         sock.settimeout(0.8)
         try:
@@ -440,14 +716,14 @@ def _plaintext_probe(host, port, timeout):
                               greet.decode("latin-1", "replace").splitlines()
                               if l.strip()), "")
                 if first:
-                    return b"", first.strip()[:120], False, ""
+                    return b"", first.strip()[:120], False, False
             if is_http:
                 rest = _recv_all(sock, READ_LIMIT - len(greet))
-                return greet + rest, None, False, ""
+                return greet + rest, None, False, False
             if is_tls:
-                return greet, None, True, ""
+                return greet, None, True, False
         try:
-            sock.sendall(_http_get(host))
+            sock.sendall(_http_get_probe(host))
             data = _recv_all(sock)
         except OSError:
             data = b""
@@ -457,107 +733,90 @@ def _plaintext_probe(host, port, timeout):
     nginx_sig = b"plain HTTP request was sent to HTTPS port" in data
     tls_hint = (_looks_like_tls(data) or nginx_sig
                 or (not data and port not in PLAINTEXT_HTTP_PORTS))
-    marker = "nginx-https" if nginx_sig else ""
-    return data, None, tls_hint, marker
+    return data, None, tls_hint, nginx_sig
 
 
-def _tls_probe(host, port, timeout, fp):
-    """Do the TLS handshake, fill transport/cert on `fp`, return HTTP bytes."""
-    try:
-        sock = _open_socket(host, port, True, timeout)
-    except OSError as e:
-        if not fp.error:
-            fp.error = f"TLS handshake failed: {e}"
-        return b""
-    try:
-        fp.transport = sock.version() or "TLS"
-        fp.tls_version = fp.transport
-        c = sock.cipher()
-        fp.cipher = c[0] if c else ""
-        fp.cert = extract_cert_info(sock)
-        try:
-            sock.sendall(_http_get(host))
-            return _recv_all(sock)
-        except OSError:
-            return b""
-    finally:
-        sock.close()
+def _decide_transport(ip, port, timeout):
+    """Returns (use_tls, raw_banner_or_None, nginx_https_marker)."""
+    if port in TLS_PORTS:
+        return True, None, False
+    _, greeting, tls_hint, nginx_sig = _plaintext_probe(ip, port, timeout)
+    if greeting is not None:
+        return False, greeting, False
+    return bool(tls_hint), None, nginx_sig
 
 
-def _error_probe(host, port, use_tls):
-    """Send a malformed request to elicit the server's native error page."""
-    try:
-        sock = _open_socket(host, port, use_tls, SOCKET_TIMEOUT)
-    except OSError:
-        return ""
-    try:
-        sock.sendall(_http_bad())
-        data = _recv_all(sock, 4096)
-    except OSError:
-        data = b""
-    finally:
-        sock.close()
-    return data.decode("latin-1", "replace")
-
-
-def fingerprint_port(host, port, timeout=SOCKET_TIMEOUT):
-    """Smart probe + unmasking for a single open TCP port."""
+def fingerprint_port(ip, hostname, port, path="/", timeout=SOCKET_TIMEOUT):
+    """Smart multi-probe fingerprint + unmasking for one open TCP port."""
     fp = Fingerprint(port=port)
-    use_tls = port in TLS_PORTS
-    marker = ""
-    http_data = b""
+    use_tls, raw_banner, nginx_marker = _decide_transport(ip, port, timeout)
+    if raw_banner is not None:
+        fp.raw_banner = raw_banner
+        return fp
 
-    if not use_tls:
-        http_data, greeting, tls_hint, marker = _plaintext_probe(
-            host, port, timeout)
-        if greeting is not None:
-            fp.raw_banner = greeting
-            return fp
-        if tls_hint:
-            use_tls = True
-            http_data = b""
+    # Probe 1: standard GET, following redirects to the real endpoint.
+    resp, chain = fetch_follow(ip, port, use_tls, hostname, path, timeout)
+    fp.redirect_chain = chain
+    fp.transport = resp.transport
+    fp.tls_version = resp.tls_version
+    fp.cipher = resp.cipher
+    fp.alpn = resp.alpn
+    fp.cert = resp.cert
+    fp.http_status = resp.status
+    fp.headers_raw = resp.headers_raw
+    fp.headers_lower = resp.headers_lower
+    fp.body_snippet = resp.body
+    fp.title = resp.title
+    fp.server_header = resp.server
+    if not resp.code:
+        if resp.raw_banner and not fp.raw_banner:
+            fp.raw_banner = resp.raw_banner
+        if resp.error:
+            fp.error = resp.error
 
-    if use_tls:
-        http_data = _tls_probe(host, port, timeout, fp)
-
-    if marker == "nginx-https":
+    if nginx_marker:
         fp.evidence.append(Evidence(
             5, "plaintext request to a TLS port returned the nginx signature "
                "'The plain HTTP request was sent to HTTPS port'", "nginx"))
 
-    if http_data:
-        parsed = _parse_http(http_data)
-        if parsed:
-            (fp.http_status, fp.headers_raw, fp.headers_lower,
-             fp.body_snippet, fp.title) = parsed
-            fp.server_header = fp.headers_lower.get("server", "")
-        elif not fp.raw_banner:
-            fp.raw_banner = http_data.decode(
-                "latin-1", "replace").splitlines()[0][:120]
+    bodies = [("main", fp.body_snippet)]
 
-    _unmask(fp, host, port, use_tls)
+    if fp.http_status:
+        # Probe 2: OPTIONS to read Allow / Public.
+        opt = http_request(ip, port, use_tls, hostname, path or "/",
+                           method="OPTIONS", timeout=timeout)
+        fp.allow = opt.headers_lower.get("allow", "") or \
+            opt.headers_lower.get("public", "")
+        # Probe 3: random path -> native 404, often reveals the real engine.
+        nf = http_request(ip, port, use_tls, hostname, _rand_path(),
+                          timeout=timeout)
+        fp.notfound_status = nf.status
+        bodies.append(("404", nf.body))
+        if nf.server and _family(nf.server) and _family(nf.server) != _family(fp.server_header):
+            fp.evidence.append(Evidence(
+                3, f"404 Server header '{nf.server}' differs from main "
+                   f"'{fp.server_header or '(none)'}'", _family(nf.server)))
+        # Probe 4: malformed HTTP/1.0 without Host -> native error page.
+        err = http_request(ip, port, use_tls, hostname, "/", http10=True,
+                           send_host=False, timeout=timeout)
+        bodies.append(("error", err.body))
+
+    _unmask(fp, bodies)
     return fp
 
 
-# --- heuristics / unmasking engine ----------------------------------------- #
-
-def _unmask(fp, host, port, use_tls):
+def _unmask(fp, bodies):
     server_family = _family(fp.server_header)
 
-    # Active error-page probe when the Server header is spoof-prone or absent.
-    if fp.http_status and (server_family in SPOOF_PRONE or not fp.server_header):
-        engine, sig = _engine_from_body(_error_probe(host, port, use_tls))
-        if engine:
+    seen = set()
+    for label, text in bodies:
+        engine, sig = _engine_from_body(text)
+        if engine and engine not in seen:
+            seen.add(engine)
+            weight = 5 if label in ("error", "404") else 4
             fp.evidence.append(Evidence(
-                5, f"default error page reveals {engine} ('{sig}')", engine))
+                weight, f"{label} body reveals {engine} ('{sig}')", engine))
 
-    # Engine signature in the main response body.
-    engine, sig = _engine_from_body(fp.body_snippet)
-    if engine:
-        fp.evidence.append(Evidence(
-            4, f"response body reveals {engine} ('{sig}')", engine))
-
-    # Fake-Cloudflare specific checks.
     if "cloudflare" in server_family:
         if "cf-ray" not in fp.headers_lower:
             fp.evidence.append(Evidence(
@@ -568,9 +827,11 @@ def _unmask(fp, host, port, use_tls):
             fp.evidence.append(Evidence(
                 4, f"TLS certificate is not from a public CDN CA "
                    f"(issuer={issuer}{extra})"))
+        if fp.transport == "TCP":
+            fp.evidence.append(Evidence(
+                3, "Server claims Cloudflare but answers over plaintext HTTP "
+                   "(a real Cloudflare edge terminates TLS)"))
 
-    # Certificate lifetime: since 2020 public CAs issue certs valid for at
-    # most ~398 days, so anything much longer is an internal / self CA.
     if fp.cert:
         days = _cert_validity_days(fp.cert)
         if days and days > 398:
@@ -579,14 +840,6 @@ def _unmask(fp, host, port, use_tls):
                    f"CAs no longer issue certificates this long "
                    f"(internal / self-signed CA)"))
 
-    # A CDN that answers over plaintext HTTP is a contradiction in itself:
-    # a real Cloudflare edge terminates TLS and never serves bare HTTP here.
-    if "cloudflare" in server_family and fp.transport == "TCP":
-        fp.evidence.append(Evidence(
-            3, "Server claims Cloudflare but answers over plaintext HTTP "
-               "(a real Cloudflare edge terminates TLS)"))
-
-    # Verdict: pick the highest-weight evidence that names a service.
     best = max((e for e in fp.evidence if e.inferred_service),
                key=lambda e: e.weight, default=None)
     if best:
@@ -599,7 +852,6 @@ def _unmask(fp, host, port, use_tls):
             and fp.inferred_service != "unknown"):
         fp.spoofed = True
 
-    # Claimed CDN contradicted by strong evidence even without a positive ID.
     if "cloudflare" in server_family and not fp.spoofed:
         if any(e.weight >= 3 for e in fp.evidence):
             fp.spoofed = True
@@ -607,17 +859,12 @@ def _unmask(fp, host, port, use_tls):
                 fp.inferred_service = "non-Cloudflare origin"
 
 
-# --- output ----------------------------------------------------------------- #
-
 def fingerprint_lines(fp, verbose):
-    """Indented report lines for one port's fingerprint."""
     out = []
     if fp.raw_banner and not fp.http_status:
         out.append(f"        {fp.raw_banner}")
         return out
     if not fp.http_status:
-        # No HTTP response, but we may still have learned something, e.g. an
-        # nginx plaintext signature seen just before a failed TLS retry.
         if fp.inferred_service or fp.evidence:
             note = f"   (TLS retry failed: {fp.error})" if fp.error else ""
             out.append(f"        Identified: {fp.inferred_service or '?'}{note}")
@@ -629,7 +876,10 @@ def fingerprint_lines(fp, verbose):
             out.append(f"        (no banner{': ' + fp.error if fp.error else ''})")
         return out
 
-    head = f"        [{fp.transport}] {fp.http_status}"
+    head = f"        [{fp.transport}"
+    if fp.alpn:
+        head += f"/{fp.alpn}"
+    head += f"] {fp.http_status}"
     if fp.title:
         head += f'  title="{fp.title}"'
     out.append(head)
@@ -646,6 +896,9 @@ def fingerprint_lines(fp, verbose):
             line += f"   (identified: {fp.inferred_service})"
         out.append(line)
 
+    if fp.redirect_chain:
+        hop = " -> ".join(f"{c}:{loc}" for c, loc in fp.redirect_chain)
+        out.append(f"        redirect: {hop}")
     if fp.cert:
         out.append(f"        cert: {fp.cert.one_line()}")
 
@@ -653,8 +906,13 @@ def fingerprint_lines(fp, verbose):
         for e in sorted(fp.evidence, key=lambda x: -x.weight):
             tag = f" -> {e.inferred_service}" if e.inferred_service else ""
             out.append(f"          - [w={e.weight}] {e.description}{tag}")
+        if fp.allow:
+            out.append(f"          Allow: {fp.allow}")
+        if fp.notfound_status:
+            out.append(f"          404 probe: {fp.notfound_status}")
         if fp.tls_version:
-            out.append(f"          TLS: {fp.tls_version} / {fp.cipher}")
+            out.append(f"          TLS: {fp.tls_version} / {fp.cipher}"
+                       + (f" / ALPN={fp.alpn}" if fp.alpn else ""))
         if fp.cert:
             if fp.cert.san:
                 out.append(f"          SAN: {', '.join(fp.cert.san[:8])}")
@@ -668,34 +926,56 @@ def fingerprint_lines(fp, verbose):
     return out
 
 
-def parse_ports(args):
-    """Turn ['22', '80', '20-25'] into a sorted, de-duplicated list of ports.
+# --------------------------------------------------------------------------- #
+# Host intelligence (Block 5)                                                  #
+# --------------------------------------------------------------------------- #
 
-    Raises ValueError on anything that is not a valid port or range.
-    """
-    ports = set()
-    for port_arg in args:
-        if '-' in port_arg:
-            start_str, _, end_str = port_arg.partition('-')
-            start, end = int(start_str), int(end_str)
-            if start > end:
-                start, end = end, start
-            for p in range(start, end + 1):
-                ports.add(p)
-        else:
-            ports.add(int(port_arg))
-    for p in ports:
-        if not 0 < p < 65536:
-            raise ValueError(f"port out of range: {p}")
-    return sorted(ports)
+# cPanel / WHM / Webmail come in (http, https) pairs.
+CPANEL_PAIRS = [((2082, 2083), "cPanel"), ((2086, 2087), "WHM"),
+                ((2095, 2096), "Webmail")]
+# Cloudflare's alternative proxy ports (minus 80/443).
+CF_ALT_PORTS = {2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096, 8080, 8443, 8880}
+# Single-port management panels / apps.
+PANEL_SINGLE = {
+    8006: "Proxmox VE", 9443: "Portainer", 9000: "Portainer/PHP-FPM",
+    3000: "Grafana", 1500: "ISPmanager", 8291: "MikroTik Winbox",
+    8083: "Plesk (alt)", 10000: "Webmin/Virtualmin",
+}
+
+
+def host_intel(open_ports, fps):
+    """Infrastructure insights from the open-port layout + fingerprints."""
+    out = []
+    op = set(open_ports)
+
+    panels = [name for pair, name in CPANEL_PAIRS if op & set(pair)]
+    if panels:
+        out.append(f"Control-panel ports present: {', '.join(panels)} "
+                   f"(cPanel/WHM hosting stack)")
+    for port, name in sorted(PANEL_SINGLE.items()):
+        if port in op:
+            out.append(f"Port {port} -> possible {name}")
+
+    cf_hit = op & CF_ALT_PORTS
+    spoofed_cf = any(
+        (f.spoofed and "cloudflare" in _family(f.server_header))
+        or "non-Cloudflare" in (f.inferred_service or "")
+        for f in fps.values())
+    if len(cf_hit) >= 4 and spoofed_cf:
+        out.append(f"{RED}[!] Host Role Insight: port layout mimics a "
+                   f"Cloudflare edge, but demasking proves the real stack is "
+                   f"self-hosted cPanel/nginx (no real Cloudflare){RESET}")
+    elif len(cf_hit) >= 4:
+        out.append("Port set matches Cloudflare's alternative ports "
+                   "(also the cPanel port range) -> likely a cPanel host")
+    return out
 
 
 # --------------------------------------------------------------------------- #
-# SYN / connect scanning                                                      #
+# SYN / XMAS / connect scanning (Block 4)                                      #
 # --------------------------------------------------------------------------- #
 
 def connect_scan_port(host, port):
-    """TCP connect() probe. No privileges required. Returns a state string."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(1)
         try:
@@ -709,29 +989,14 @@ def connect_scan_port(host, port):
             return f"error: {e}"
 
 
-def connect_scan(host, ports, verbose=False, banner=False):
-    try:
-        target_ip = socket.gethostbyname(host)
-    except socket.gaierror as e:
-        print(f"Cannot resolve {host}: {e}")
-        return
-    print(f"Connect scan of {host} ({target_ip}) - {len(ports)} port(s)")
-    _run_pool(connect_scan_port, host, ports, verbose, banner)
-
-
-# --------------------------------------------------------------------------- #
-# Raw-packet scanning (SYN / XMAS) - needs root                               #
-# --------------------------------------------------------------------------- #
-
 def build_ip_header(source_ip, dest_ip):
     ip_ihl_ver = (4 << 4) + 5
-    ip_tot_len = 40                      # 20 IP + 20 TCP
+    ip_tot_len = 40
     ip_id = 0x6ea9
     ip_ttl = 64
     ip_proto = socket.IPPROTO_TCP
     ip_saddr = socket.inet_aton(source_ip)
     ip_daddr = socket.inet_aton(dest_ip)
-
     header = struct.pack('!BBHHHBBH4s4s', ip_ihl_ver, 0, ip_tot_len,
                          ip_id, 0, ip_ttl, ip_proto, 0, ip_saddr, ip_daddr)
     ip_check = checksum(header)
@@ -743,114 +1008,108 @@ def build_tcp_header(source_ip, dest_ip, source_port, dest_port, flags):
     tcp_seq = 0
     tcp_ack_seq = 0
     tcp_doff = 5
-    tcp_window = 1024                    # packed big-endian below, swapped once
+    tcp_window = 1024
     tcp_urg_ptr = 0
     tcp_offset_res = (tcp_doff << 4)
-
     tcp_header = struct.pack('!HHLLBBHHH', source_port, dest_port, tcp_seq,
                              tcp_ack_seq, tcp_offset_res, flags,
                              tcp_window, 0, tcp_urg_ptr)
-
     pseudo = struct.pack('!4s4sBBH', socket.inet_aton(source_ip),
                          socket.inet_aton(dest_ip), 0,
                          socket.IPPROTO_TCP, len(tcp_header))
     tcp_check = checksum(pseudo + tcp_header)
-
     return struct.pack('!HHLLBBHHH', source_port, dest_port, tcp_seq,
                        tcp_ack_seq, tcp_offset_res, flags,
                        tcp_window, tcp_check, tcp_urg_ptr)
 
 
-def raw_scan(host, ports, flags, interpret, verbose=False, banner=False):
-    """Send one crafted TCP packet per port and read replies on a shared
-    IPPROTO_TCP socket, matching them back to the port by src/dst.
-
-    `flags` is the TCP flag byte to send; `interpret(tcp_flags)` maps a
-    reply's flags to a state, or returns None for 'no reply'.
-    """
-    try:
-        target_ip = socket.gethostbyname(host)
-    except socket.gaierror as e:
-        print(f"Cannot resolve {host}: {e}")
-        return
-
-    source_ip = get_source_ip(target_ip)
-    base_sport = 40000
-
-    try:
-        send_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW,
-                                  socket.IPPROTO_RAW)
-        send_sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-        # Replies to our crafted packets arrive here, not on IPPROTO_RAW.
-        recv_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW,
-                                  socket.IPPROTO_TCP)
-    except PermissionError:
-        print("Raw sockets need root. Try: sudo python3 sxp.py")
-        return
-
-    print(f"Raw scan of {host} ({target_ip}) from {source_ip} - "
-          f"{len(ports)} port(s)")
-
-    results = {}
-    # source port per scanned port lets us map a reply back to its probe
-    sport_of = {(base_sport + i) % 65536 or 1: p for i, p in enumerate(ports)}
-
-    for sport, port in sport_of.items():
-        pkt = (build_ip_header(source_ip, target_ip) +
-               build_tcp_header(source_ip, target_ip, sport, port, flags))
-        try:
-            send_sock.sendto(pkt, (target_ip, 0))
-        except OSError as e:
-            results[port] = f"error: {e}"
-
-    deadline = time.time() + 2
-    pending = {p for p in ports if p not in results}
-    while pending and time.time() < deadline:
-        recv_sock.settimeout(max(0.05, deadline - time.time()))
-        try:
-            data, addr = recv_sock.recvfrom(65535)
-        except socket.timeout:
-            break
-        except OSError:
-            continue
-        if addr[0] != target_ip or len(data) < 40:
-            continue
-        ihl = (data[0] & 0x0f) * 4
-        if len(data) < ihl + 20:
-            continue
-        src_port, dst_port = struct.unpack('!HH', data[ihl:ihl + 4])
-        tcp_flags = data[ihl + 13]
-        if dst_port not in sport_of or src_port != sport_of[dst_port]:
-            continue
-        state = interpret(tcp_flags)
-        if state is not None:
-            results[sport_of[dst_port]] = state
-            pending.discard(sport_of[dst_port])
-
-    send_sock.close()
-    recv_sock.close()
-
-    for port in ports:
-        results.setdefault(port, "open|filtered")
-    _report(host, results, verbose, banner)
-
-
 def syn_interpret(tcp_flags):
-    if tcp_flags & 0x12 == 0x12:          # SYN+ACK
+    if tcp_flags & 0x12 == 0x12:
         return "open"
-    if tcp_flags & 0x04:                  # RST
+    if tcp_flags & 0x04:
         return "closed"
     return None
 
 
 def xmas_interpret(tcp_flags):
-    if tcp_flags & 0x04:                  # RST -> closed
+    if tcp_flags & 0x04:
         return "closed"
-    return None                           # no reply -> open|filtered
+    return None
+
+
+def raw_scan(ip, host_label, ports, flags, interpret, default_state, timeout=2.0):
+    """Two-pass SYN/XMAS scan with port shuffling and a retransmit pass.
+
+    Returns {port: state}. No reply after both passes becomes `default_state`
+    (filtered for SYN, open|filtered for XMAS).
+    """
+    source_ip = get_source_ip(ip)
+    try:
+        send_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW,
+                                  socket.IPPROTO_RAW)
+        send_sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+        recv_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW,
+                                  socket.IPPROTO_TCP)
+    except PermissionError:
+        print("Raw sockets need root. Try: sudo python3 sxp.py")
+        return None, source_ip
+
+    # Shuffle so we don't hammer a firewall's rate-limit in port order.
+    order = list(ports)
+    random.shuffle(order)
+    sport_of = {(40000 + i) % 65536 or 1: p for i, p in enumerate(order)}
+    port_sport = {p: s for s, p in sport_of.items()}
+    results = {}
+
+    def send(targets):
+        for p in targets:
+            pkt = (build_ip_header(source_ip, ip) +
+                   build_tcp_header(source_ip, ip, port_sport[p], p, flags))
+            try:
+                send_sock.sendto(pkt, (ip, 0))
+            except OSError as e:
+                results[p] = f"error: {e}"
+
+    def listen(deadline, pending):
+        while pending and time.time() < deadline:
+            recv_sock.settimeout(max(0.05, deadline - time.time()))
+            try:
+                data, addr = recv_sock.recvfrom(65535)
+            except socket.timeout:
+                break
+            except OSError:
+                continue
+            if addr[0] != ip or len(data) < 40:
+                continue
+            ihl = (data[0] & 0x0f) * 4
+            if len(data) < ihl + 20:
+                continue
+            src_port, dst_port = struct.unpack('!HH', data[ihl:ihl + 4])
+            if dst_port not in sport_of or src_port != sport_of[dst_port]:
+                continue
+            state = interpret(data[ihl + 13])
+            if state is not None:
+                results[sport_of[dst_port]] = state
+                pending.discard(sport_of[dst_port])
+
+    pending = set(p for p in ports if p not in results)
+    send(pending)
+    listen(time.time() + timeout, pending)
+    # Retransmit pass for everything still silent (packet loss insurance).
+    if pending:
+        time.sleep(0.3)
+        send(set(pending))
+        listen(time.time() + timeout, pending)
+
+    send_sock.close()
+    recv_sock.close()
+    for p in ports:
+        results.setdefault(p, default_state)
+    return results, source_ip
 
 
 # --------------------------------------------------------------------------- #
-# ICMP ping                                                                   #
+# ICMP ping                                                                    #
 # --------------------------------------------------------------------------- #
 
 def create_icmp_packet(packet_id):
@@ -867,23 +1126,18 @@ def icmp_ping(host):
     except socket.gaierror as e:
         print(f"Cannot resolve {host}: {e}")
         return
-
     packet_id = int(time.time() * 1000) & 0xffff
     packet = create_icmp_packet(packet_id)
-
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_RAW,
                              socket.IPPROTO_ICMP)
     except PermissionError:
         print("ICMP ping needs root. Try: sudo python3 sxp.py")
         return
-
     try:
         start = time.time()
         sock.sendto(packet, (target_ip, 0))
         deadline = start + 2
-        # Read until we see our own echo reply, skipping other traffic
-        # (including the echo request the kernel loops back on localhost).
         while time.time() < deadline:
             sock.settimeout(max(0.05, deadline - time.time()))
             try:
@@ -897,7 +1151,7 @@ def icmp_ping(host):
                 '!BBHHH', data[ihl:ihl + 8])
             if icmp_type == 0 and reply_id == packet_id:
                 rtt = (time.time() - start) * 1000
-                ttl = data[8]               # TTL byte in the reply's IP header
+                ttl = data[8]
                 print(f"Reply from {addr[0]}: {len(data)} bytes, "
                       f"ttl={ttl}, RTT {rtt:.2f} ms")
                 return
@@ -907,146 +1161,169 @@ def icmp_ping(host):
 
 
 # --------------------------------------------------------------------------- #
-# Shared helpers                                                              #
+# Scan orchestration + reporting                                               #
 # --------------------------------------------------------------------------- #
 
-def _run_pool(scan_fn, host, ports, verbose, banner=False):
-    results = {}
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(scan_fn, host, p): p for p in ports}
-        for fut in as_completed(futures):
-            results[futures[fut]] = fut.result()
-    _report(host, results, verbose, banner)
-
-
-def _report(host, results, verbose, banner=False):
-    open_ports = [p for p in sorted(results) if results[p] == "open"]
-
-    # Fingerprint open ports in parallel so TLS/cert/error probes don't
-    # serialize the scan. Fingerprinting must never crash the scan itself.
+def _fingerprint_open(ip, hostname, open_ports):
     fps = {}
-    if banner and open_ports:
-        workers = min(MAX_WORKERS, max(4, len(open_ports)))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(fingerprint_port, host, p): p
-                       for p in open_ports}
-            for fut in as_completed(futures):
-                port = futures[fut]
-                try:
-                    fps[port] = fut.result()
-                except Exception as e:                       # noqa: BLE001
-                    fp = Fingerprint(port=port)
-                    fp.error = f"fingerprint error: {e}"
-                    fps[port] = fp
+    if not open_ports:
+        return fps
+    workers = min(MAX_WORKERS, max(4, len(open_ports)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(fingerprint_port, ip, hostname, p): p
+                   for p in open_ports}
+        for fut in as_completed(futures):
+            port = futures[fut]
+            try:
+                fps[port] = fut.result()
+            except Exception as e:                         # noqa: BLE001
+                fp = Fingerprint(port=port)
+                fp.error = f"fingerprint error: {e}"
+                fps[port] = fp
+    return fps
 
-    shown = 0
+
+def _emit_scan(spec, results, fps, elapsed, scan_type, verbose):
+    """Print a scan report and return a JSON-able structure of it."""
+    open_ports = sorted(p for p in results if results[p] == "open")
+    struct_ports = []
+
     for port in sorted(results):
         state = results[port]
-        if not (verbose or state == "open" or state.startswith("error")):
+        is_open = state == "open"
+        is_err = state.startswith("error")
+        entry = {"port": port, "state": state}
+        if is_open:
+            entry["service"] = service_name(port)
+        else:
+            entry["port_hint"] = service_name(port)
+        if is_open and port in fps:
+            entry["fingerprint"] = asdict(fps[port])
+        struct_ports.append(entry)
+
+        if not (verbose or is_open or is_err):
             continue
-        print(f"Port {port:>5}: {state:<12} {service_name(port)}")
-        shown += 1
-        if banner and state == "open" and port in fps:
-            for line in fingerprint_lines(fps[port], verbose):
+        if is_open:
+            print(f"Port {port:>5}: {GREEN}open{RESET}         {service_name(port)}")
+            for line in fingerprint_lines(fps.get(port, Fingerprint(port=port)),
+                                          verbose):
                 print(line)
+        else:
+            hint = service_name(port)
+            hint_txt = f"  (port-hint: {hint})" if hint != "unknown" else ""
+            print(f"Port {port:>5}: {state}{hint_txt}")
 
-    if not verbose and shown == 0:
-        print("No open ports found (use 'verbose on' to see all states).")
-    print(f"Done. {len(open_ports)} open / {len(results)} scanned.")
+    # Summary footer.
+    total = len(results)
+    n_open = len(open_ports)
+    n_closed = sum(1 for s in results.values() if s == "closed")
+    n_filtered = sum(1 for s in results.values()
+                     if s in ("filtered", "open|filtered"))
+    n_err = sum(1 for s in results.values() if s.startswith("error"))
+    tail = ""
+    if n_filtered and n_filtered > n_open and n_closed <= max(3, total // 100):
+        tail = " (default-drop firewall detected)"
+    err_txt = f", {n_err} errored" if n_err else ""
+    summary = (f"Scanned {total} ports in {elapsed:.2f}s: "
+               f"{n_open} open, {n_closed} closed, {n_filtered} filtered"
+               f"{err_txt}{tail}")
+    print(summary)
+
+    insights = host_intel(open_ports, fps)
+    for line in insights:
+        print(f"  {line}")
+
+    return {
+        "type": scan_type,
+        "target": {"input": spec.host_input, "hostname": spec.hostname,
+                   "ip": spec.ip},
+        "elapsed_s": round(elapsed, 3),
+        "summary": summary,
+        "insights": insights,
+        "ports": struct_ports,
+    }
+
+
+def run_scan(spec, scan_type, verbose, banner):
+    """Drive a syn/xmas/connect scan and print + return structured results."""
+    ip, label = spec.ip, spec.hostname
+    print(f"{scan_type.upper()} scan of {label} ({ip}) - "
+          f"{len(spec.ports)} port(s)")
+    start = time.time()
+
+    if scan_type == "connect":
+        results = {}
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            futures = {pool.submit(connect_scan_port, ip, p): p
+                       for p in spec.ports}
+            for fut in as_completed(futures):
+                results[futures[fut]] = fut.result()
+    else:
+        flags, interp, default_state = (
+            (0x02, syn_interpret, "filtered") if scan_type == "syn"
+            else (0x29, xmas_interpret, "open|filtered"))
+        results, src = raw_scan(ip, label, spec.ports, flags, interp,
+                                default_state)
+        if results is None:
+            return None
+        print(f"(source IP {src})")
+
+    open_ports = sorted(p for p in results if results[p] == "open")
+    fps = _fingerprint_open(ip, label, open_ports) if banner else {}
+    elapsed = time.time() - start
+    return _emit_scan(spec, results, fps, elapsed, scan_type, verbose)
+
+
+def run_fingerprint(spec, verbose):
+    """Deep L7 fingerprint of specific ports (no full port scan)."""
+    ip, label = spec.ip, spec.hostname
+    print(f"Fingerprint of {label} ({ip}) on ports "
+          f"{', '.join(map(str, spec.ports))}")
+    start = time.time()
+    fps = _fingerprint_open(ip, label, spec.ports)
+    struct_ports = []
+    for port in spec.ports:
+        fp = fps.get(port, Fingerprint(port=port))
+        reachable = bool(fp.http_status or fp.raw_banner or fp.evidence)
+        print(f"Port {port:>5}: " +
+              (f"{GREEN}responded{RESET}" if reachable else "no response"))
+        for line in fingerprint_lines(fp, True):
+            print(line)
+        struct_ports.append({"port": port, "fingerprint": asdict(fp)})
+    elapsed = time.time() - start
+    insights = host_intel([p for p in spec.ports
+                           if fps.get(p) and fps[p].http_status], fps)
+    for line in insights:
+        print(f"  {line}")
+    print(f"Fingerprinted {len(spec.ports)} port(s) in {elapsed:.2f}s")
+    return {
+        "type": "fingerprint",
+        "target": {"input": spec.host_input, "hostname": spec.hostname,
+                   "ip": spec.ip},
+        "elapsed_s": round(elapsed, 3),
+        "insights": insights,
+        "ports": struct_ports,
+    }
 
 
 # --------------------------------------------------------------------------- #
-# Self-update                                                                 #
+# WAF / CDN detection (Block 3)                                                #
 # --------------------------------------------------------------------------- #
 
-def fetch_latest(timeout=10):
-    """Download the latest sxp.py. Returns its bytes, or None on failure."""
-    try:
-        req = urllib.request.Request(
-            UPDATE_URL, headers={"User-Agent": f"sxp-scanner/{VERSION}"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read()
-    except Exception:
-        return None
-
-
-def remote_version(remote_bytes):
-    m = re.search(rb'^VERSION = "([^"]+)"', remote_bytes, re.MULTILINE)
-    return m.group(1).decode() if m else "?"
-
-
-def update_available(remote_bytes):
-    """True if the remote copy differs from the file we are running."""
-    try:
-        with open(os.path.abspath(__file__), "rb") as f:
-            local = f.read()
-    except OSError:
-        return False
-    return hashlib.sha256(remote_bytes).digest() != hashlib.sha256(local).digest()
-
-
-def self_update():
-    """Replace the running sxp.py with the latest copy from the repo."""
-    print(f"Checking {UPDATE_URL} ...")
-    remote = fetch_latest()
-    if remote is None:
-        print("Update check failed (network error or file not reachable).")
-        return
-    if not update_available(remote):
-        print(f"Already up to date (version {VERSION}).")
-        return
-
-    rv = remote_version(remote)
-    print(f"Update available: {VERSION} -> {rv}")
-    path = os.path.abspath(__file__)
-    try:
-        # Write to a temp file in the same dir, then atomically swap it in,
-        # so a half-written download can never corrupt the installed script.
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
-        with os.fdopen(fd, "wb") as f:
-            f.write(remote)
-        os.chmod(tmp, os.stat(path).st_mode)
-        os.replace(tmp, path)
-    except PermissionError:
-        print(f"Cannot write {path}: permission denied. Re-run with sudo "
-              f"(or: sudo sxp, then 'update').")
-        return
-    except OSError as e:
-        print(f"Update failed: {e}")
-        return
-    print("Updated successfully. Restart sxp to run the new version.")
-
-
-def startup_update_check():
-    """Non-blocking: print a one-line notice if a newer version exists."""
-    remote = fetch_latest(timeout=4)
-    if remote is not None and update_available(remote):
-        print(f"{GREEN}[*] Update available: {VERSION} -> "
-              f"{remote_version(remote)}. Type 'update' to install.{RESET}")
-
-
-# --------------------------------------------------------------------------- #
-# WAF / firewall detection (L7)                                               #
-# --------------------------------------------------------------------------- #
-
-# HTTP status codes a WAF typically returns when it blocks a request.
 WAF_BLOCK_CODES = {403, 406, 418, 419, 429, 494, 495, 496, 501}
 
-# Benign-looking requests carrying classic attack patterns. A plain web
-# server serves/404s them; a WAF intercepts with a block or challenge.
 WAF_PROBES = [
-    ("sqli", "/?id=1%27%20OR%20%271%27%3D%271"),            # 1' OR '1'='1
-    ("xss", "/?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E"),     # <script>alert(1)</script>
+    ("sqli", "/?id=1%27%20OR%20%271%27%3D%271"),
+    ("xss", "/?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E"),
     ("lfi", "/?file=../../../../../../../etc/passwd"),
     ("rce", "/?cmd=;cat%20/etc/passwd"),
 ]
-# A hostile User-Agent (Shellshock) sent with an otherwise normal request.
 WAF_BAD_UA = "() { :;}; /bin/bash -c 'id'"
 
-# (name, header-key, value-substring or None = header presence alone)
 WAF_HEADER_SIGS = [
     ("Cloudflare", "cf-ray", None),
     ("Cloudflare", "cf-cache-status", None),
+    ("Cloudflare", "cf-mitigated", None),
     ("Cloudflare", "server", "cloudflare"),
     ("Imperva Incapsula", "x-iinfo", None),
     ("Imperva Incapsula", "x-cdn", "incapsula"),
@@ -1062,9 +1339,12 @@ WAF_HEADER_SIGS = [
     ("Barracuda", "server", "barracuda"),
     ("FortiWeb", "server", "fortiweb"),
     ("ModSecurity", "server", "mod_security"),
+    ("DDoS-Guard", "server", "ddos-guard"),
+    ("Qrator", "server", "qrator"),
 ]
-# (name, cookie-name-substring)
 WAF_COOKIE_SIGS = [
+    ("Cloudflare", "__cf_bm"),
+    ("Cloudflare", "cf_clearance"),
     ("Imperva Incapsula", "incap_ses"),
     ("Imperva Incapsula", "visid_incap"),
     ("F5 BIG-IP", "TS01"),
@@ -1074,8 +1354,9 @@ WAF_COOKIE_SIGS = [
     ("FortiWeb", "FORTIWAFSID"),
     ("Airlock", "AL_SESS"),
 ]
-# (name, body-substring, lowercased)
 WAF_BODY_SIGS = [
+    ("Cloudflare (challenge)", "just a moment"),
+    ("Cloudflare (challenge)", "_cf_chl_opt"),
     ("Cloudflare", "attention required!"),
     ("Cloudflare", "cloudflare ray id"),
     ("ModSecurity", "mod_security"),
@@ -1084,13 +1365,20 @@ WAF_BODY_SIGS = [
     ("Imperva Incapsula", "powered by incapsula"),
     ("Wordfence", "generated by wordfence"),
     ("Citrix NetScaler", "violation of security policy"),
+    ("DDoS-Guard", "ddos-guard"),
+    ("StormWall", "stormwall"),
+    ("Qrator", "qrator"),
+    ("Bitrix Cloud Protection", "bitrix"),
+    ("NAXSI", "naxsi"),
 ]
-# Generic block-page phrases (no specific vendor).
 WAF_BLOCK_BODY = (
     "has been blocked", "request blocked", "access denied",
     "web application firewall", "not acceptable", "forbidden",
-    "blocked by", "security policy",
+    "blocked by", "security policy", "/blocked", "/captcha",
 )
+WAF_CHALLENGE_SIGS = ("just a moment", "_cf_chl_opt", "checking your browser",
+                      "ddos-guard", "stormwall", "qrator",
+                      "attention required", "ray id")
 
 
 @dataclass
@@ -1098,112 +1386,103 @@ class WafResult:
     port: int
     transport: str = "TCP"
     baseline_status: str = ""
-    blocked: List[Tuple[str, int]] = field(default_factory=list)
+    baseline_rtt_ms: float = 0.0
+    baseline_length: int = 0
+    redirect_note: str = ""
+    challenge: str = ""
+    blocked: List[Tuple[str, int, str]] = field(default_factory=list)
     waf_names: List[str] = field(default_factory=list)
     evidence: List[str] = field(default_factory=list)
     spoof_note: str = ""
     error: str = ""
 
 
-def _send_http(host, port, use_tls, path, timeout, extra_headers=None):
-    """Send one HTTP request and return the parsed response, or None."""
-    try:
-        sock = _open_socket(host, port, use_tls, timeout)
-    except OSError:
-        return None
-    try:
-        lines = [
-            f"GET {path} HTTP/1.1",
-            f"Host: {host}",
-            "User-Agent: Mozilla/5.0 (compatible; SXP-Scanner/1.2)",
-            "Accept: */*",
-        ]
-        for k, v in (extra_headers or {}).items():
-            lines.append(f"{k}: {v}")
-        lines += ["Connection: close", "", ""]
-        sock.sendall("\r\n".join(lines).encode("latin-1", "replace"))
-        data = _recv_all(sock)
-    except OSError:
-        return None
-    finally:
-        sock.close()
-    return _parse_http(data)
+def _cookie_names(resp):
+    names = set()
+    for c in resp.cookies:
+        name = c.split("=", 1)[0].strip().lower()
+        if name:
+            names.add(name)
+    return names
 
 
-def _status_code(status_line):
-    parts = status_line.split()
-    if len(parts) >= 2 and parts[1].isdigit():
-        return int(parts[1])
-    return 0
+def _blob(resp):
+    return "\n".join(f"{k}: {v}" for k, v in resp.headers_raw).lower()
 
 
-def _headers_blob(resp):
-    """Lowercased 'key: value' text of every header (keeps duplicates)."""
-    _, raw, _, _, _ = resp
-    return "\n".join(f"{k}: {v}" for k, v in raw).lower()
-
-
-def _is_block_response(resp, base_code):
-    code = _status_code(resp[0])
-    body = (resp[3] or "").lower()
-    if code in WAF_BLOCK_CODES and code != base_code:
-        return True
-    return any(sig in body for sig in WAF_BLOCK_BODY)
-
-
-def waf_detect(host, port, timeout=SOCKET_TIMEOUT):
-    """Probe one web port for a WAF / reverse proxy at the HTTP layer."""
+def waf_detect(ip, hostname, port, timeout=SOCKET_TIMEOUT):
+    """L7 WAF/CDN probe: baseline + attack probes + differential analysis."""
     result = WafResult(port=port)
 
-    # Establish transport (and prove the port speaks HTTP) with a baseline.
-    base = None
     use_tls = port in TLS_PORTS
+    base = None
     for try_tls in ([True] if use_tls else [False, True]):
-        base = _send_http(host, port, try_tls, "/", timeout)
-        if base is not None:
+        resp, chain = fetch_follow(ip, port, try_tls, hostname, "/", timeout)
+        if resp.code:
             use_tls = try_tls
+            base = resp
+            if chain:
+                result.redirect_note = " -> ".join(
+                    f"{c}:{loc}" for c, loc in chain)
             break
     if base is None:
         result.error = "no HTTP response (not a web port, or filtered)"
         return result
 
-    result.transport = "TLSv?" if use_tls else "TCP"
-    if use_tls:
-        try:
-            s = _open_socket(host, port, True, timeout)
-            result.transport = s.version() or "TLS"
-            s.close()
-        except OSError:
-            pass
-    result.baseline_status = base[0]
-    base_code = _status_code(base[0])
+    result.transport = base.transport
+    result.baseline_status = base.status
+    result.baseline_rtt_ms = round(base.rtt_ms, 1)
+    result.baseline_length = base.length
+    base_code = base.code
+    base_cookies = _cookie_names(base)
+
+    # Passive challenge detection on the baseline itself.
+    low_body = base.body.lower()
+    low_blob = _blob(base)
+    if "cf-mitigated:" in low_blob or any(s in low_body for s in WAF_CHALLENGE_SIGS):
+        result.challenge = "JS challenge / CAPTCHA page on baseline"
 
     responses = [base]
-    for name, path in WAF_PROBES:
-        r = _send_http(host, port, use_tls, path, timeout)
-        if r is None:
+    probes = [(n, p, None) for n, p in WAF_PROBES]
+    probes.append(("bad-user-agent", "/", {"User-Agent": WAF_BAD_UA}))
+    for name, path, extra in probes:
+        r = http_request(ip, port, use_tls, hostname, path,
+                         extra_headers=extra, timeout=timeout)
+        if not r.code and not r.body:
             continue
         responses.append(r)
-        if _is_block_response(r, base_code):
-            result.blocked.append((name, _status_code(r[0])))
-    # Hostile User-Agent on a normal path.
-    r = _send_http(host, port, use_tls, "/", timeout, {"User-Agent": WAF_BAD_UA})
-    if r is not None:
-        responses.append(r)
-        if _is_block_response(r, base_code):
-            result.blocked.append(("bad-user-agent", _status_code(r[0])))
+        reason = ""
+        if r.code in WAF_BLOCK_CODES and r.code != base_code:
+            reason = f"status {base_code}->{r.code}"
+        elif any(sig in r.body.lower() for sig in WAF_BLOCK_BODY):
+            reason = "block-page body"
+        elif (r.code == base_code and base.length > 1500
+              and r.length < max(500, base.length * 0.4)):
+            reason = f"body shrank {base.length}->{r.length} bytes"
+        elif r.code in (301, 302, 303, 307, 308) and any(
+                x in r.location.lower() for x in ("block", "captcha", "denied")):
+            reason = f"redirect to {r.location}"
+        else:
+            # New WAF-looking cookies appearing only after an attack probe are
+            # themselves a soft block signal.
+            new_cookies = _cookie_names(r) - base_cookies
+            for _, ck in WAF_COOKIE_SIGS:
+                if any(ck.lower() in c for c in new_cookies):
+                    reason = f"set new cookie '{ck}' on attack probe"
+                    break
+        if reason:
+            result.blocked.append((name, r.code, reason))
 
-    # Fingerprint the WAF/CDN across every response we collected.
+    # Fingerprint vendor across all responses.
     names, evidence = set(), set()
-    seen_cf_ray = False
-    claims_cloudflare = False
+    seen_cf_ray = claims_cf = False
     for resp in responses:
-        blob = _headers_blob(resp)
-        body = (resp[3] or "").lower()
+        blob = _blob(resp)
+        body = resp.body.lower()
         if re.search(r"(?m)^cf-ray:", blob):
             seen_cf_ray = True
         if re.search(r"(?m)^server:.*cloudflare", blob):
-            claims_cloudflare = True
+            claims_cf = True
         for wname, hkey, hval in WAF_HEADER_SIGS:
             if hval is None:
                 if re.search(rf"(?m)^{re.escape(hkey)}:", blob):
@@ -1219,13 +1498,12 @@ def waf_detect(host, port, timeout=SOCKET_TIMEOUT):
         for wname, sig in WAF_BODY_SIGS:
             if sig in body:
                 names.add(wname)
-                evidence.add(f"block page body: '{sig}' -> {wname}")
+                evidence.add(f"body: '{sig}' -> {wname}")
 
-    # A Cloudflare *claim* with no cf-ray anywhere is the spoof we saw before.
-    if claims_cloudflare and not seen_cf_ray:
+    if claims_cf and not seen_cf_ray:
         result.spoof_note = ("Server claims Cloudflare but no 'cf-ray' in any "
-                             "response -> header is spoofed, not a real CF edge")
-        names.discard("Cloudflare")
+                             "response -> spoofed header, not a real CF edge")
+        names = {n for n in names if not n.startswith("Cloudflare")}
         evidence = {e for e in evidence if "-> Cloudflare" not in e}
 
     result.waf_names = sorted(names)
@@ -1238,7 +1516,12 @@ def waf_lines(res):
     if res.error:
         out.append(f"  WAF probe: {res.error}")
         return out
-    out.append(f"  [{res.transport}] baseline {res.baseline_status}")
+    out.append(f"  [{res.transport}] baseline {res.baseline_status} "
+               f"({res.baseline_length} bytes, {res.baseline_rtt_ms} ms)")
+    if res.redirect_note:
+        out.append(f"  baseline redirect: {res.redirect_note}")
+    if res.challenge:
+        out.append(f"  {YELLOW}[*] {res.challenge}{RESET}")
     if res.waf_names:
         out.append(f"  {RED}[!] WAF/CDN detected: {', '.join(res.waf_names)}{RESET}")
     elif res.blocked:
@@ -1250,39 +1533,120 @@ def waf_lines(res):
     if res.spoof_note:
         out.append(f"  {RED}[!] {res.spoof_note}{RESET}")
     if res.blocked:
-        shown = ", ".join(f"{n}->{c}" for n, c in res.blocked)
-        out.append(f"  Blocked probes: {shown}")
+        for name, code, reason in res.blocked:
+            out.append(f"  blocked: {name} -> {code} ({reason})")
     else:
-        out.append("  Blocked probes: none "
-                   "(SQLi/XSS/LFI/RCE/bad-UA all got through)")
+        out.append("  blocked: none (SQLi/XSS/LFI/RCE/bad-UA all got through)")
     for e in res.evidence:
         out.append(f"    - {e}")
     return out
 
 
+def run_waf(spec, timeout=SOCKET_TIMEOUT):
+    """Run the WAF probe on the first port that speaks HTTP; return struct."""
+    ip, label = spec.ip, spec.hostname
+    for port in spec.ports:
+        print(f"WAF probe of {label}:{port} ...")
+        res = waf_detect(ip, label, port, timeout)
+        if res.error and len(spec.ports) > 1:
+            print(f"  {res.error}; trying next port...")
+            continue
+        for line in waf_lines(res):
+            print(line)
+        return {
+            "type": "waf",
+            "target": {"input": spec.host_input, "hostname": label, "ip": ip},
+            "port": port,
+            "result": asdict(res),
+        }
+    print("  No web port responded.")
+    return None
+
+
 # --------------------------------------------------------------------------- #
-# CLI                                                                         #
+# Self-update                                                                  #
+# --------------------------------------------------------------------------- #
+
+def fetch_latest(timeout=10):
+    try:
+        req = urllib.request.Request(
+            UPDATE_URL, headers={"User-Agent": f"sxp-scanner/{VERSION}"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except Exception:
+        return None
+
+
+def remote_version(remote_bytes):
+    m = re.search(rb'^VERSION = "([^"]+)"', remote_bytes, re.MULTILINE)
+    return m.group(1).decode() if m else "?"
+
+
+def update_available(remote_bytes):
+    try:
+        with open(os.path.abspath(__file__), "rb") as f:
+            local = f.read()
+    except OSError:
+        return False
+    return hashlib.sha256(remote_bytes).digest() != hashlib.sha256(local).digest()
+
+
+def self_update():
+    print(f"Checking {UPDATE_URL} ...")
+    remote = fetch_latest()
+    if remote is None:
+        print("Update check failed (network error or file not reachable).")
+        return
+    if not update_available(remote):
+        print(f"Already up to date (version {VERSION}).")
+        return
+    print(f"Update available: {VERSION} -> {remote_version(remote)}")
+    path = os.path.abspath(__file__)
+    try:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+        with os.fdopen(fd, "wb") as f:
+            f.write(remote)
+        os.chmod(tmp, os.stat(path).st_mode)
+        os.replace(tmp, path)
+    except PermissionError:
+        print(f"Cannot write {path}: permission denied. Re-run with sudo.")
+        return
+    except OSError as e:
+        print(f"Update failed: {e}")
+        return
+    print("Updated successfully. Restart sxp to run the new version.")
+
+
+def startup_update_check():
+    remote = fetch_latest(timeout=4)
+    if remote is not None and update_available(remote):
+        print(f"{GREEN}[*] Update available: {VERSION} -> "
+              f"{remote_version(remote)}. Type 'update' to install.{RESET}")
+
+
+# --------------------------------------------------------------------------- #
+# CLI                                                                          #
 # --------------------------------------------------------------------------- #
 
 class PortScanner(cmd.Cmd):
     intro = GREEN + """
 ================================================================================
-SXP Scanner 1.2 - Multi-threaded scanner with SYN/XMAS/ICMP + service unmasking
+SXP Scanner 1.3 - scanning, service unmasking, WAF detection & host intel
 ================================================================================
-By: Egwyl666
-GitHub: https://github.com/egwyl666
+By: Egwyl666   GitHub: https://github.com/egwyl666
 ================================================================================
-Usage:
-  - Type 'help' or '?' to list commands
-  - 'syn <host> <port1> <port2> ...' or 'syn <host> <start>-<end>'
-  - 'connect <host> <ports>'  (TCP connect, no root needed)
-  - 'xmas <host> <ports>'
-  - 'ping <host>'
-  - 'verbose on|off'  to show closed/filtered ports too
-  - 'banner on|off'   fingerprint open ports & unmask spoofed services
-  - 'waf <host> <port>'  probe a web port for a WAF/CDN (L7)
-  - 'update'  to download and install the latest version
-  - 'exit' to quit
+Targets accept host, host:port or URL (https://site.com:8443/path).
+  syn <target> <ports>        raw half-open SYN scan      (root)
+  connect <target> <ports>    TCP connect scan            (no root)
+  xmas <target> <ports>       FIN+PSH+URG scan            (root)
+  fp <target> [ports]         deep L7 fingerprint (default 80,443,8080,8443)
+  waf <target> [port]         probe a web port for a WAF/CDN (L7)
+  ping <host>                 ICMP echo / TTL / RTT       (root)
+  verbose on|off              show closed/filtered ports & full evidence
+  banner on|off               fingerprint open ports during a scan
+  export <file.json>          save the last result as JSON
+  update                      install the latest version
+  exit
 ================================================================================
     """ + RESET
     prompt = BLUE + "(SXP) " + RESET
@@ -1291,57 +1655,62 @@ Usage:
         super().__init__(*a, **kw)
         self.verbose = False
         self.banner = False
+        self.last_result = None
 
-    def _ports(self, args):
-        try:
-            return parse_ports(args)
-        except ValueError as e:
-            print(f"Invalid port(s): {e}")
+    # -- helpers ----------------------------------------------------------- #
+
+    def _target(self, arg, default_ports=None, need_ports=False):
+        parts = arg.split()
+        if not parts:
+            print("Usage: <command> <target> [ports]")
             return None
+        spec = parse_target(parts[0], port_args=parts[1:] or None,
+                            default_ports=default_ports)
+        if spec.error:
+            print(spec.error)
+            return None
+        if need_ports and not spec.ports:
+            print("Specify port(s), e.g. 'syn host 1-1024' or 'syn host:8443'")
+            return None
+        return spec
+
+    # -- scans ------------------------------------------------------------- #
 
     def do_syn(self, arg):
-        'Raw SYN (stealth) scan: syn <host> <ports>   (needs root)'
-        args = arg.split()
-        if len(args) < 2:
-            print("Usage: syn <host> <port1> <port2> ... | <start>-<end>")
-            return
-        ports = self._ports(args[1:])
-        if ports:
-            raw_scan(args[0], ports, 0x02, syn_interpret, self.verbose, self.banner)
+        'Raw SYN scan: syn <target> <ports>   (needs root)'
+        spec = self._target(arg, need_ports=True)
+        if spec:
+            res = run_scan(spec, "syn", self.verbose, self.banner)
+            if res:
+                self.last_result = res
 
     def do_connect(self, arg):
-        'TCP connect scan (no root needed): connect <host> <ports>'
-        args = arg.split()
-        if len(args) < 2:
-            print("Usage: connect <host> <port1> <port2> ... | <start>-<end>")
-            return
-        ports = self._ports(args[1:])
-        if ports:
-            connect_scan(args[0], ports, self.verbose, self.banner)
+        'TCP connect scan: connect <target> <ports>'
+        spec = self._target(arg, need_ports=True)
+        if spec:
+            self.last_result = run_scan(spec, "connect", self.verbose, self.banner)
 
     def do_xmas(self, arg):
-        'Raw XMAS scan (FIN+PSH+URG): xmas <host> <ports>   (needs root)'
-        args = arg.split()
-        if len(args) < 2:
-            print("Usage: xmas <host> <port1> <port2> ... | <start>-<end>")
-            return
-        ports = self._ports(args[1:])
-        if ports:
-            raw_scan(args[0], ports, 0x29, xmas_interpret, self.verbose, self.banner)
+        'XMAS scan: xmas <target> <ports>   (needs root)'
+        spec = self._target(arg, need_ports=True)
+        if spec:
+            res = run_scan(spec, "xmas", self.verbose, self.banner)
+            if res:
+                self.last_result = res
+
+    def do_fp(self, arg):
+        'Deep L7 fingerprint: fp <target> [ports]  (default 80,443,8080,8443)'
+        spec = self._target(arg, default_ports=[80, 443, 8080, 8443])
+        if spec:
+            self.last_result = run_fingerprint(spec, self.verbose)
+
+    do_inspect = do_fp
 
     def do_waf(self, arg):
-        'Probe a web port for a WAF/CDN at the HTTP layer: waf <host> <port>'
-        args = arg.split()
-        if len(args) != 2 or not args[1].isdigit():
-            print("Usage: waf <host> <port>")
-            return
-        port = int(args[1])
-        if not 0 < port < 65536:
-            print("Invalid port.")
-            return
-        print(f"WAF probe of {args[0]}:{port} ...")
-        for line in waf_lines(waf_detect(args[0], port)):
-            print(line)
+        'Probe a web port for a WAF/CDN: waf <target> [port]'
+        spec = self._target(arg, default_ports=[443, 80])
+        if spec:
+            self.last_result = run_waf(spec)
 
     def do_ping(self, arg):
         'Ping a host with ICMP echo: ping <host>   (needs root)'
@@ -1350,8 +1719,10 @@ Usage:
             return
         icmp_ping(arg.strip())
 
+    # -- toggles / utility ------------------------------------------------- #
+
     def do_verbose(self, arg):
-        'Show all port states, not just open: verbose on|off'
+        'Show all port states and full evidence: verbose on|off'
         val = arg.strip().lower()
         if val in ("on", "true", "1"):
             self.verbose = True
@@ -1360,13 +1731,30 @@ Usage:
         print(f"verbose = {self.verbose}")
 
     def do_banner(self, arg):
-        'Grab a service banner from each open port: banner on|off'
+        'Fingerprint open ports during a scan: banner on|off'
         val = arg.strip().lower()
         if val in ("on", "true", "1"):
             self.banner = True
         elif val in ("off", "false", "0"):
             self.banner = False
         print(f"banner = {self.banner}")
+
+    def do_export(self, arg):
+        'Save the last scan/fp/waf result as JSON: export <file.json>'
+        path = arg.strip()
+        if not path:
+            print("Usage: export <file.json>")
+            return
+        if self.last_result is None:
+            print("Nothing to export yet. Run a scan, fp or waf first.")
+            return
+        try:
+            with open(path, "w") as f:
+                json.dump(self.last_result, f, indent=2, default=str)
+        except OSError as e:
+            print(f"Export failed: {e}")
+            return
+        print(f"Exported last result to {path}")
 
     def do_update(self, arg):
         'Download and install the latest version: update'
@@ -1382,7 +1770,6 @@ Usage:
 
 if __name__ == "__main__":
     print(LOGO)
-    # Check for a newer version in the background so it never delays startup.
     if os.environ.get("SXP_NO_UPDATE_CHECK") != "1":
         threading.Thread(target=startup_update_check, daemon=True).start()
     try:

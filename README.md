@@ -4,17 +4,21 @@ SXP Scanner is a lightweight, multi-threaded network scanner (SYN, XMAS, TCP con
 
 ## Features
 
-- **SYN Scan**: Raw half-open scan. A SYN/ACK reply means the port is open, RST means closed. Stealthier than a full connect and requires root.
+- **Targets**: every command accepts a host, `host:port`, or a full URL (`https://site.com:8443/path?a=1`). Domains are resolved to an IP, but the original hostname is kept for TLS SNI and the `Host` header.
+- **SYN Scan**: Raw half-open scan. SYN/ACK = open, RST = closed, **no reply = filtered** (a default-drop firewall). Ports are shuffled and silent ports get a second retransmit pass to rule out packet loss. Stealthy; requires root.
 - **Connect Scan**: Full TCP `connect()` handshake. Needs no privileges, but is logged by the target.
-- **XMAS Scan**: Sends FIN + PSH + URG. A RST reply means closed; silence means open or filtered (per RFC 793).
-- **ICMP Ping**: Sends an ICMP Echo request and reports round-trip time.
-- **Service detection & unmasking** (`banner on`): a smart probe fingerprints each open port and sees through services that masquerade as something else (e.g. a reverse proxy faking `Server: cloudflare`):
-  - Auto-detects TLS and falls back to a TLS handshake on HTTPS ports (standard 443/8443/9443/4443 and any port that answers plaintext with a TLS alert or the nginx "plain HTTP request was sent to HTTPS port" signature).
-  - Parses the full HTTP response: status, `<title>`, and all headers (original case preserved).
-  - Extracts the TLS certificate even with verification off (subject/issuer/SAN/validity, self-signed flag) plus the negotiated TLS version and cipher.
-  - Runs an **unmasking engine**: flags a fake Cloudflare (no `cf-ray` header, non-public-CA or self-signed cert), reads the server's native error page (`<center>nginx</center>`, `Apache/`, `LiteSpeed`, …), and prints a verdict such as `[!] SPOOFED: claims 'cloudflare' -> likely 'nginx'`.
+- **XMAS Scan**: Sends FIN + PSH + URG. RST = closed; silence = open|filtered (per RFC 793).
+- **ICMP Ping**: ICMP Echo with size, TTL and round-trip time.
+- **Deep fingerprint** (`fp <target> [ports]`): run the L7 fingerprint, certificate check and unmasking on specific ports (default `80,443,8080,8443`) without a full port scan.
+- **Host intelligence**: every scan ends with a summary (`N open, N closed, N filtered`, default-drop firewall note) and infrastructure insights — control-panel ports (cPanel/WHM/Webmail, Plesk, Proxmox, Portainer, Grafana, MikroTik, …) and a Cloudflare-port-mimicry flag when the port layout imitates a CDN but unmasking proves a self-hosted origin.
+- **Export** (`export <file.json>`): save the last scan / fingerprint / WAF result as structured JSON (ports, evidence, certificates, insights).
+- **Service detection & unmasking** (`banner on`, or `fp`): a multi-probe fingerprint that sees through services masquerading as something else (e.g. a reverse proxy faking `Server: cloudflare`):
+  - Auto-detects TLS and falls back to a TLS handshake on HTTPS ports; follows up to 2 same-host redirects to reach the real endpoint.
+  - Sends profiled probes: a standard `GET`, an `OPTIONS` (reads `Allow`), a random path to trigger the native 404 page (often reveals the real engine), and a malformed HTTP/1.0 request for the native error page.
+  - Parses full HTTP responses (status, `<title>`, headers in original case), decodes `Transfer-Encoding: chunked`, and reads the TLS certificate even with verification off (subject/issuer/SAN/validity/self-signed) plus TLS version, cipher and the negotiated **ALPN** (`h2` vs `http/1.1`).
+  - Runs an **unmasking engine** with weighted evidence (fake Cloudflare: no `cf-ray`, non-public-CA/self-signed cert, >398-day cert, CDN over plaintext; engine signatures in the 404/error body) and prints a verdict such as `[!] SPOOFED: claims 'cloudflare' -> likely 'nginx'`.
   - Still grabs plain banners from greeting services (SSH/FTP/SMTP).
-- **WAF / CDN detection** (`waf <host> <port>`): an L7 probe that sends a benign baseline plus attack-pattern requests (SQLi, XSS, LFI, RCE, hostile User-Agent) and compares the responses. Reports whether a WAF blocks the attacks, fingerprints the vendor from headers/cookies/block pages (Cloudflare, Imperva, Akamai, Sucuri, AWS WAF, F5, Barracuda, FortiWeb, ModSecurity, …), and flags a spoofed `Server: cloudflare` with no `cf-ray`.
+- **WAF / CDN detection** (`waf <target> [port]`): an L7 probe that sends a benign baseline (following redirects) plus attack-pattern requests (SQLi, XSS, LFI, RCE, hostile User-Agent) and does a differential analysis — status change, block-page body, body-size collapse, new WAF cookies, redirect to a block page — with per-request RTT. Detects JS/CAPTCHA challenges (`cf-mitigated`, "Just a moment", DDoS-Guard, Qrator, StormWall, …), fingerprints the vendor (Cloudflare, Imperva, Akamai, Sucuri, AWS WAF, F5, Barracuda, FortiWeb, NAXSI, ModSecurity, …), and flags a spoofed `Server: cloudflare` with no `cf-ray`.
 - **Self-update**: SXP checks for a newer version on startup and can update itself in place with the `update` command.
 - Multi-threaded with a bounded thread pool (scans and fingerprinting), so large port ranges won't exhaust file descriptors.
 - `verbose` shows closed/filtered ports and, with `banner on`, the full evidence list, header dump, and certificate detail behind each verdict.
@@ -55,29 +59,37 @@ sudo python3 sxp.py
 
 ## Commands
 
-Ports can be given as a list, a range, or a mix:
+Targets accept a host, `host:port`, or a URL. Ports can be a list, a range,
+a comma list, or a mix:
 
 ```
 syn     scanme.nmap.org 22 80 443
 syn     scanme.nmap.org 20-25
 connect scanme.nmap.org 1-1024
 xmas    scanme.nmap.org 22 80 443
+fp      https://site.com:8443/login       # deep fingerprint, one endpoint
+fp      site.com                          # defaults to 80,443,8080,8443
+waf     site.com                          # auto-tries 443 then 80
+waf     site.com 8443
 ping    scanme.nmap.org
-verbose on        # also show closed/filtered ports
-banner  on        # grab service banners from open ports
+verbose on        # also show closed/filtered ports and full evidence
+banner  on        # fingerprint open ports during a scan
+export  out.json  # save the last result as JSON
 exit
 ```
 
 | Command | What it does | Needs root |
 |---------|--------------|:----------:|
-| `syn <host> <ports>`     | Raw half-open SYN scan      | yes |
-| `connect <host> <ports>` | TCP connect scan            | no  |
-| `xmas <host> <ports>`    | FIN+PSH+URG scan            | yes |
-| `ping <host>`            | ICMP echo / RTT             | yes |
-| `verbose on\|off`        | Show all port states        | —   |
-| `banner on\|off`         | Fingerprint & unmask open ports | —  |
-| `waf <host> <port>`      | Probe a web port for a WAF/CDN (L7) | no |
-| `update`                 | Install the latest version   | yes* |
+| `syn <target> <ports>`     | Raw half-open SYN scan      | yes |
+| `connect <target> <ports>` | TCP connect scan            | no  |
+| `xmas <target> <ports>`    | FIN+PSH+URG scan            | yes |
+| `fp <target> [ports]`      | Deep L7 fingerprint + unmasking | no |
+| `waf <target> [port]`      | Probe a web port for a WAF/CDN (L7) | no |
+| `ping <host>`              | ICMP echo / TTL / RTT       | yes |
+| `verbose on\|off`          | Show all port states & full evidence | — |
+| `banner on\|off`           | Fingerprint open ports during a scan | — |
+| `export <file.json>`       | Save the last result as JSON | no |
+| `update`                   | Install the latest version   | yes* |
 
 \* `update` needs write access to the installed script, so run it under `sudo` (the `sxp` launcher already re-execs as root). It downloads `sxp.py` from the repo and swaps it in atomically; restart SXP afterwards. A newer version is also announced automatically at startup. Set `SXP_NO_UPDATE_CHECK=1` to silence that check.
 
