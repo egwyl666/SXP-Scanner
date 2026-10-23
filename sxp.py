@@ -2,13 +2,18 @@ import cmd
 import hashlib
 import os
 import re
+import shutil
 import socket
+import ssl
 import struct
+import subprocess
 import tempfile
 import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
 
 RED = "\033[31m"
 GREEN = "\033[32m"
@@ -17,7 +22,7 @@ RESET = "\033[0m"
 
 MAX_WORKERS = 200
 
-VERSION = "1.1"
+VERSION = "1.2"
 # Where `update` pulls a fresh sxp.py from. Both are overridable via env
 # so a fork or a local mirror can be used for testing.
 UPDATE_BASE = os.environ.get(
@@ -80,36 +85,558 @@ def service_name(port):
     return "unknown"
 
 
-# Ports where a server stays silent until the client speaks first.
-_HTTP_PORTS = {80, 81, 591, 8000, 8008, 8080, 8081, 8443, 8888}
+# --------------------------------------------------------------------------- #
+# Service fingerprinting / unmasking                                          #
+# --------------------------------------------------------------------------- #
+
+# Ports assumed to speak TLS from the first byte.
+TLS_PORTS = {443, 8443, 9443, 4443}
+# Plaintext HTTP ports where an empty reply is normal (no TLS fallback).
+PLAINTEXT_HTTP_PORTS = {80, 81, 591, 8000, 8008, 8080, 8081, 8888}
+# Server headers commonly spoofed; seeing one is worth an error-page probe.
+SPOOF_PRONE = {"cloudflare", "apache", "iis", "microsoft-iis", "gws",
+               "openresty"}
+# Issuer names that legitimately appear in front of public CDNs / sites.
+PUBLIC_CA_HINTS = ("cloudflare", "google trust", "digicert", "lets encrypt",
+                   "let's encrypt", "amazon", "sectigo", "globalsign",
+                   "baltimore", "isrg")
+SOCKET_TIMEOUT = 2.5
+READ_LIMIT = 8192
+
+# Default error-page body signatures admins often forget to mask.
+_BODY_SIGS = [
+    ("nginx", "<center>nginx</center>"),
+    ("openresty", "openresty"),
+    ("apache", "<address>apache"),
+    ("apache", "apache/"),
+    ("iis", "microsoft-iis"),
+    ("litespeed", "litespeed"),
+    ("caddy", "caddy"),
+]
 
 
-def grab_banner(host, port):
-    """Connect to an open TCP port and read a short service banner.
+@dataclass
+class CertInfo:
+    subject_cn: str = ""
+    subject_o: str = ""
+    issuer_cn: str = ""
+    issuer_o: str = ""
+    san: List[str] = field(default_factory=list)
+    not_before: str = ""
+    not_after: str = ""
+    self_signed: bool = False
+    source: str = ""           # how the cert was decoded
 
-    Many services greet immediately (SSH, FTP, SMTP); HTTP-like ports need
-    a nudge first. Returns a one-line string, or '' if nothing came back.
-    """
+    def one_line(self):
+        issuer = self.issuer_o or self.issuer_cn or "?"
+        tag = " (self-signed)" if self.self_signed else ""
+        return f"CN={self.subject_cn or '?'} | Issuer={issuer}{tag}"
+
+
+@dataclass
+class Evidence:
+    weight: int
+    description: str
+    inferred_service: str = ""
+
+
+@dataclass
+class Fingerprint:
+    port: int
+    transport: str = "TCP"          # "TCP" or a TLS version string
+    tls_version: str = ""
+    cipher: str = ""
+    cert: Optional[CertInfo] = None
+    http_status: str = ""
+    title: str = ""
+    server_header: str = ""
+    headers_raw: List[Tuple[str, str]] = field(default_factory=list)
+    headers_lower: dict = field(default_factory=dict)
+    body_snippet: str = ""
+    raw_banner: str = ""            # non-HTTP services (SSH, FTP, SMTP, ...)
+    evidence: List[Evidence] = field(default_factory=list)
+    inferred_service: str = ""
+    spoofed: bool = False
+    error: str = ""
+
+
+# --- transport helpers ----------------------------------------------------- #
+
+def _tls_context():
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    # Accept legacy/odd servers too; we only want to read, not to trust.
     try:
-        with socket.create_connection((host, port), timeout=2) as s:
-            s.settimeout(2)
-            try:
-                data = s.recv(256)
-            except socket.timeout:
-                data = b""
-            if not data:
-                probe = (b"HEAD / HTTP/1.0\r\n\r\n"
-                         if port in _HTTP_PORTS else b"\r\n")
-                try:
-                    s.sendall(probe)
-                    data = s.recv(256)
-                except OSError:
-                    data = b""
+        ctx.set_ciphers("ALL:@SECLEVEL=0")
+    except ssl.SSLError:
+        pass
+    return ctx
+
+
+def _open_socket(host, port, use_tls, timeout=SOCKET_TIMEOUT):
+    raw = socket.create_connection((host, port), timeout=timeout)
+    raw.settimeout(timeout)
+    if not use_tls:
+        return raw
+    ctx = _tls_context()
+    try:
+        return ctx.wrap_socket(raw, server_hostname=host)
+    except (ssl.SSLError, ValueError, OSError):
+        try:
+            raw.close()
+        except OSError:
+            pass
+        # Retry without SNI (e.g. host is a bare IP address).
+        raw2 = socket.create_connection((host, port), timeout=timeout)
+        raw2.settimeout(timeout)
+        try:
+            return ctx.wrap_socket(raw2)
+        except (ssl.SSLError, OSError):
+            raw2.close()
+            raise
+
+
+def _recv_all(sock, limit=READ_LIMIT):
+    chunks = []
+    total = 0
+    while total < limit:
+        try:
+            part = sock.recv(min(4096, limit - total))
+        except socket.timeout:
+            break
+        except OSError:
+            break
+        if not part:
+            break
+        chunks.append(part)
+        total += len(part)
+    return b"".join(chunks)
+
+
+def _looks_like_tls(data):
+    # TLS record header: 0x16 handshake / 0x15 alert, then 0x03 version byte.
+    return len(data) >= 2 and data[0] in (0x15, 0x16) and data[1] == 0x03
+
+
+# --- HTTP helpers ----------------------------------------------------------- #
+
+def _http_get(host):
+    return (
+        "GET / HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        "User-Agent: Mozilla/5.0 (compatible; SXP-Scanner/1.2)\r\n"
+        "Accept: */*\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode()
+
+
+def _http_bad():
+    # Empty Host makes nginx and friends answer with their native 400 page.
+    return b"GET / HTTP/1.1\r\nHost: \r\n\r\n"
+
+
+def _parse_http(data):
+    """Parse an HTTP response, or return None if `data` is not one."""
+    if not data[:5].upper().startswith(b"HTTP/"):
+        return None
+    head, _, body = data.partition(b"\r\n\r\n")
+    lines = head.split(b"\r\n")
+    status_line = lines[0].decode("latin-1", "replace").strip()
+    headers_raw = []
+    headers_lower = {}
+    for ln in lines[1:]:
+        if b":" not in ln:
+            continue
+        k, _, v = ln.partition(b":")
+        key = k.decode("latin-1", "replace").strip()
+        val = v.decode("latin-1", "replace").strip()
+        headers_raw.append((key, val))
+        headers_lower[key.lower()] = val
+    body_text = body[:2048].decode("latin-1", "replace")
+    m = re.search(r"<title[^>]*>(.*?)</title>", body_text,
+                  re.IGNORECASE | re.DOTALL)
+    title = re.sub(r"\s+", " ", m.group(1)).strip()[:120] if m else ""
+    return status_line, headers_raw, headers_lower, body_text, title
+
+
+def _engine_from_body(body):
+    """Identify a web engine from body signatures: (engine, matched_sig)."""
+    if not body:
+        return "", ""
+    low = body.lower()
+    for engine, sig in _BODY_SIGS:
+        if sig in low:
+            return engine, sig
+    return "", ""
+
+
+def _family(server_header):
+    """First token of a Server header, lowercased: 'nginx/1.18' -> 'nginx'."""
+    if not server_header or not server_header.strip():
+        return ""
+    return server_header.split("/")[0].split()[0].strip().lower()
+
+
+# --- TLS certificate extraction (stdlib hack + fallbacks) ------------------- #
+
+def _name_field(name_seq, key):
+    """Pull a value from the ((('commonName','x'),),...) RDN structure."""
+    for rdn in name_seq or ():
+        for attr in rdn:
+            if attr[0] == key:
+                return attr[1]
+    return ""
+
+
+def _cert_via_stdlib(pem):
+    decode = getattr(getattr(ssl, "_ssl", None), "_test_decode_cert", None)
+    if decode is None:
+        return None
+    fd, path = tempfile.mkstemp(suffix=".pem")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(pem)
+        d = decode(path)
+    except (ssl.SSLError, OSError, ValueError, TypeError):
+        return None
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    ci = CertInfo(source="stdlib")
+    ci.subject_cn = _name_field(d.get("subject"), "commonName")
+    ci.subject_o = _name_field(d.get("subject"), "organizationName")
+    ci.issuer_cn = _name_field(d.get("issuer"), "commonName")
+    ci.issuer_o = _name_field(d.get("issuer"), "organizationName")
+    ci.not_before = d.get("notBefore", "")
+    ci.not_after = d.get("notAfter", "")
+    for entry in d.get("subjectAltName", ()):
+        if len(entry) == 2:
+            ci.san.append(f"{entry[0]}:{entry[1]}")
+    return ci
+
+
+def _openssl_field(text, prefix, key):
+    for line in text.splitlines():
+        if line.lower().startswith(prefix + "="):
+            m = re.search(rf"\b{key}\s*=\s*([^,/]+)", line)
+            if m:
+                return m.group(1).strip()
+    return ""
+
+
+def _cert_via_openssl(pem):
+    if not shutil.which("openssl"):
+        return None
+    try:
+        out = subprocess.run(
+            ["openssl", "x509", "-noout", "-subject", "-issuer",
+             "-dates", "-ext", "subjectAltName"],
+            input=pem, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    text = out.stdout + out.stderr
+    ci = CertInfo(source="openssl")
+    ci.subject_cn = _openssl_field(text, "subject", "CN")
+    ci.subject_o = _openssl_field(text, "subject", "O")
+    ci.issuer_cn = _openssl_field(text, "issuer", "CN")
+    ci.issuer_o = _openssl_field(text, "issuer", "O")
+    nb = re.search(r"notBefore=(.+)", text)
+    na = re.search(r"notAfter=(.+)", text)
+    ci.not_before = nb.group(1).strip() if nb else ""
+    ci.not_after = na.group(1).strip() if na else ""
+    for m in re.finditer(r"(DNS|IP Address):([^,\s]+)", text):
+        ci.san.append(f"{m.group(1)}:{m.group(2)}")
+    return ci
+
+
+def _cert_via_der_scan(der):
+    """Last-resort: pull commonName strings straight out of the DER bytes."""
+    ci = CertInfo(source="der-scan")
+    cns = []
+    marker = b"\x06\x03\x55\x04\x03"   # OID 2.5.4.3 = commonName
+    i = 0
+    while True:
+        j = der.find(marker, i)
+        if j == -1:
+            break
+        k = j + len(marker)
+        if k + 2 <= len(der):
+            strlen = der[k + 1]
+            val = der[k + 2:k + 2 + strlen]
+            if val:
+                cns.append(val.decode("utf-8", "replace"))
+        i = j + 1
+    if cns:
+        ci.subject_cn = cns[0]
+        if len(cns) > 1:
+            ci.issuer_cn = cns[-1]
+    return ci
+
+
+def extract_cert_info(sslsock):
+    """Decode the peer certificate even when verification is disabled."""
+    try:
+        der = sslsock.getpeercert(binary_form=True)
+    except (ssl.SSLError, OSError):
+        der = None
+    if not der:
+        return None
+    pem = ssl.DER_cert_to_PEM_cert(der)
+    info = _cert_via_stdlib(pem) or _cert_via_openssl(pem) \
+        or _cert_via_der_scan(der)
+    if info is not None:
+        info.self_signed = bool(
+            info.subject_cn
+            and info.subject_cn == info.issuer_cn
+            and (info.subject_o or "") == (info.issuer_o or ""))
+    return info
+
+
+def _cert_is_private(cert):
+    """True if the cert is self-signed or from a non-public / internal CA."""
+    if cert.self_signed:
+        return True
+    issuer = f"{cert.issuer_o} {cert.issuer_cn}".lower().strip()
+    if not issuer:
+        return True
+    return not any(h in issuer for h in PUBLIC_CA_HINTS)
+
+
+# --- probe pipeline --------------------------------------------------------- #
+
+def _plaintext_probe(host, port, timeout):
+    """Returns (http_bytes, greeting_or_None, tls_hint, marker)."""
+    try:
+        sock = _open_socket(host, port, False, timeout)
+    except OSError:
+        return b"", None, False, ""
+    try:
+        sock.settimeout(0.8)
+        try:
+            greet = sock.recv(512)
+        except (socket.timeout, OSError):
+            greet = b""
+        sock.settimeout(timeout)
+        if greet:
+            is_http = greet[:5].upper().startswith(b"HTTP/")
+            is_tls = _looks_like_tls(greet)
+            if not is_http and not is_tls:
+                first = next((l for l in
+                              greet.decode("latin-1", "replace").splitlines()
+                              if l.strip()), "")
+                if first:
+                    return b"", first.strip()[:120], False, ""
+            if is_http:
+                rest = _recv_all(sock, READ_LIMIT - len(greet))
+                return greet + rest, None, False, ""
+            if is_tls:
+                return greet, None, True, ""
+        try:
+            sock.sendall(_http_get(host))
+            data = _recv_all(sock)
+        except OSError:
+            data = b""
+    finally:
+        sock.close()
+
+    nginx_sig = b"plain HTTP request was sent to HTTPS port" in data
+    tls_hint = (_looks_like_tls(data) or nginx_sig
+                or (not data and port not in PLAINTEXT_HTTP_PORTS))
+    marker = "nginx-https" if nginx_sig else ""
+    return data, None, tls_hint, marker
+
+
+def _tls_probe(host, port, timeout, fp):
+    """Do the TLS handshake, fill transport/cert on `fp`, return HTTP bytes."""
+    try:
+        sock = _open_socket(host, port, True, timeout)
+    except OSError as e:
+        if not fp.error:
+            fp.error = f"TLS handshake failed: {e}"
+        return b""
+    try:
+        fp.transport = sock.version() or "TLS"
+        fp.tls_version = fp.transport
+        c = sock.cipher()
+        fp.cipher = c[0] if c else ""
+        fp.cert = extract_cert_info(sock)
+        try:
+            sock.sendall(_http_get(host))
+            return _recv_all(sock)
+        except OSError:
+            return b""
+    finally:
+        sock.close()
+
+
+def _error_probe(host, port, use_tls):
+    """Send a malformed request to elicit the server's native error page."""
+    try:
+        sock = _open_socket(host, port, use_tls, SOCKET_TIMEOUT)
     except OSError:
         return ""
-    text = data.decode("latin-1", "replace").strip()
-    line = text.splitlines()[0] if text else ""
-    return line[:80]
+    try:
+        sock.sendall(_http_bad())
+        data = _recv_all(sock, 4096)
+    except OSError:
+        data = b""
+    finally:
+        sock.close()
+    return data.decode("latin-1", "replace")
+
+
+def fingerprint_port(host, port, timeout=SOCKET_TIMEOUT):
+    """Smart probe + unmasking for a single open TCP port."""
+    fp = Fingerprint(port=port)
+    use_tls = port in TLS_PORTS
+    marker = ""
+    http_data = b""
+
+    if not use_tls:
+        http_data, greeting, tls_hint, marker = _plaintext_probe(
+            host, port, timeout)
+        if greeting is not None:
+            fp.raw_banner = greeting
+            return fp
+        if tls_hint:
+            use_tls = True
+            http_data = b""
+
+    if use_tls:
+        http_data = _tls_probe(host, port, timeout, fp)
+
+    if marker == "nginx-https":
+        fp.evidence.append(Evidence(
+            5, "plaintext request to a TLS port returned the nginx signature "
+               "'The plain HTTP request was sent to HTTPS port'", "nginx"))
+
+    if http_data:
+        parsed = _parse_http(http_data)
+        if parsed:
+            (fp.http_status, fp.headers_raw, fp.headers_lower,
+             fp.body_snippet, fp.title) = parsed
+            fp.server_header = fp.headers_lower.get("server", "")
+        elif not fp.raw_banner:
+            fp.raw_banner = http_data.decode(
+                "latin-1", "replace").splitlines()[0][:120]
+
+    _unmask(fp, host, port, use_tls)
+    return fp
+
+
+# --- heuristics / unmasking engine ----------------------------------------- #
+
+def _unmask(fp, host, port, use_tls):
+    server_family = _family(fp.server_header)
+
+    # Active error-page probe when the Server header is spoof-prone or absent.
+    if fp.http_status and (server_family in SPOOF_PRONE or not fp.server_header):
+        engine, sig = _engine_from_body(_error_probe(host, port, use_tls))
+        if engine:
+            fp.evidence.append(Evidence(
+                5, f"default error page reveals {engine} ('{sig}')", engine))
+
+    # Engine signature in the main response body.
+    engine, sig = _engine_from_body(fp.body_snippet)
+    if engine:
+        fp.evidence.append(Evidence(
+            4, f"response body reveals {engine} ('{sig}')", engine))
+
+    # Fake-Cloudflare specific checks.
+    if "cloudflare" in server_family:
+        if "cf-ray" not in fp.headers_lower:
+            fp.evidence.append(Evidence(
+                3, "Server claims Cloudflare but no 'cf-ray' header present"))
+        if fp.cert and _cert_is_private(fp.cert):
+            issuer = fp.cert.issuer_o or fp.cert.issuer_cn or "?"
+            extra = ", self-signed" if fp.cert.self_signed else ""
+            fp.evidence.append(Evidence(
+                4, f"TLS certificate is not from a public CDN CA "
+                   f"(issuer={issuer}{extra})"))
+
+    # Verdict: pick the highest-weight evidence that names a service.
+    best = max((e for e in fp.evidence if e.inferred_service),
+               key=lambda e: e.weight, default=None)
+    if best:
+        fp.inferred_service = best.inferred_service
+    elif server_family:
+        fp.inferred_service = server_family
+
+    if (server_family and fp.inferred_service
+            and fp.inferred_service != server_family
+            and fp.inferred_service != "unknown"):
+        fp.spoofed = True
+
+    # Claimed CDN contradicted by strong evidence even without a positive ID.
+    if "cloudflare" in server_family and not fp.spoofed:
+        if any(e.weight >= 3 for e in fp.evidence):
+            fp.spoofed = True
+            if not best:
+                fp.inferred_service = "non-Cloudflare origin"
+
+
+# --- output ----------------------------------------------------------------- #
+
+def fingerprint_lines(fp, verbose):
+    """Indented report lines for one port's fingerprint."""
+    out = []
+    if fp.raw_banner and not fp.http_status:
+        out.append(f"        {fp.raw_banner}")
+        return out
+    if not fp.http_status:
+        # No HTTP response, but we may still have learned something, e.g. an
+        # nginx plaintext signature seen just before a failed TLS retry.
+        if fp.inferred_service or fp.evidence:
+            note = f"   (TLS retry failed: {fp.error})" if fp.error else ""
+            out.append(f"        Identified: {fp.inferred_service or '?'}{note}")
+            if verbose:
+                for e in sorted(fp.evidence, key=lambda x: -x.weight):
+                    tag = f" -> {e.inferred_service}" if e.inferred_service else ""
+                    out.append(f"          - [w={e.weight}] {e.description}{tag}")
+        else:
+            out.append(f"        (no banner{': ' + fp.error if fp.error else ''})")
+        return out
+
+    head = f"        [{fp.transport}] {fp.http_status}"
+    if fp.title:
+        head += f'  title="{fp.title}"'
+    out.append(head)
+
+    claimed_family = _family(fp.server_header)
+    if fp.server_header or fp.spoofed or fp.inferred_service:
+        claimed = fp.server_header or "(none)"
+        line = f"        Server: {claimed}"
+        if fp.spoofed:
+            line += (f"   {RED}[!] SPOOFED: claims "
+                     f"'{claimed_family or claimed}' -> likely "
+                     f"'{fp.inferred_service}'{RESET}")
+        elif fp.inferred_service and fp.inferred_service != claimed_family:
+            line += f"   (identified: {fp.inferred_service})"
+        out.append(line)
+
+    if fp.cert:
+        out.append(f"        cert: {fp.cert.one_line()}")
+
+    if verbose:
+        for e in sorted(fp.evidence, key=lambda x: -x.weight):
+            tag = f" -> {e.inferred_service}" if e.inferred_service else ""
+            out.append(f"          - [w={e.weight}] {e.description}{tag}")
+        if fp.tls_version:
+            out.append(f"          TLS: {fp.tls_version} / {fp.cipher}")
+        if fp.cert:
+            if fp.cert.san:
+                out.append(f"          SAN: {', '.join(fp.cert.san[:8])}")
+            out.append(
+                f"          Validity: {fp.cert.not_before or '?'} .. "
+                f"{fp.cert.not_after or '?'} (decoded via {fp.cert.source})")
+        if fp.headers_raw:
+            out.append("          Headers:")
+            for k, v in fp.headers_raw:
+                out.append(f"            {k}: {v}")
+    return out
 
 
 def parse_ports(args):
@@ -364,22 +891,39 @@ def _run_pool(scan_fn, host, ports, verbose, banner=False):
 
 
 def _report(host, results, verbose, banner=False):
+    open_ports = [p for p in sorted(results) if results[p] == "open"]
+
+    # Fingerprint open ports in parallel so TLS/cert/error probes don't
+    # serialize the scan. Fingerprinting must never crash the scan itself.
+    fps = {}
+    if banner and open_ports:
+        workers = min(MAX_WORKERS, max(4, len(open_ports)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(fingerprint_port, host, p): p
+                       for p in open_ports}
+            for fut in as_completed(futures):
+                port = futures[fut]
+                try:
+                    fps[port] = fut.result()
+                except Exception as e:                       # noqa: BLE001
+                    fp = Fingerprint(port=port)
+                    fp.error = f"fingerprint error: {e}"
+                    fps[port] = fp
+
     shown = 0
     for port in sorted(results):
         state = results[port]
         if not (verbose or state == "open" or state.startswith("error")):
             continue
-        line = f"Port {port:>5}: {state:<12} {service_name(port)}"
-        if banner and state == "open":
-            b = grab_banner(host, port)
-            if b:
-                line += f"  | {b}"
-        print(line)
+        print(f"Port {port:>5}: {state:<12} {service_name(port)}")
         shown += 1
-    open_count = sum(1 for s in results.values() if s == "open")
+        if banner and state == "open" and port in fps:
+            for line in fingerprint_lines(fps[port], verbose):
+                print(line)
+
     if not verbose and shown == 0:
         print("No open ports found (use 'verbose on' to see all states).")
-    print(f"Done. {open_count} open / {len(results)} scanned.")
+    print(f"Done. {len(open_ports)} open / {len(results)} scanned.")
 
 
 # --------------------------------------------------------------------------- #
@@ -459,7 +1003,7 @@ def startup_update_check():
 class PortScanner(cmd.Cmd):
     intro = GREEN + """
 ================================================================================
-SXP Scanner 1.1 - Multi-threaded network scanner for SYN, XMAS, and ICMP scans
+SXP Scanner 1.2 - Multi-threaded scanner with SYN/XMAS/ICMP + service unmasking
 ================================================================================
 By: Egwyl666
 GitHub: https://github.com/egwyl666
@@ -471,7 +1015,7 @@ Usage:
   - 'xmas <host> <ports>'
   - 'ping <host>'
   - 'verbose on|off'  to show closed/filtered ports too
-  - 'banner on|off'   to grab a service banner from open ports
+  - 'banner on|off'   fingerprint open ports & unmask spoofed services
   - 'update'  to download and install the latest version
   - 'exit' to quit
 ================================================================================
