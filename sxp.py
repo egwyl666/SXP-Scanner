@@ -55,6 +55,48 @@ def get_source_ip(target_ip):
         s.close()
 
 
+def service_name(port):
+    """Well-known service name for a port, from the system services DB."""
+    for proto in ("tcp", "udp"):
+        try:
+            return socket.getservbyport(port, proto)
+        except OSError:
+            continue
+    return "unknown"
+
+
+# Ports where a server stays silent until the client speaks first.
+_HTTP_PORTS = {80, 81, 591, 8000, 8008, 8080, 8081, 8443, 8888}
+
+
+def grab_banner(host, port):
+    """Connect to an open TCP port and read a short service banner.
+
+    Many services greet immediately (SSH, FTP, SMTP); HTTP-like ports need
+    a nudge first. Returns a one-line string, or '' if nothing came back.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=2) as s:
+            s.settimeout(2)
+            try:
+                data = s.recv(256)
+            except socket.timeout:
+                data = b""
+            if not data:
+                probe = (b"HEAD / HTTP/1.0\r\n\r\n"
+                         if port in _HTTP_PORTS else b"\r\n")
+                try:
+                    s.sendall(probe)
+                    data = s.recv(256)
+                except OSError:
+                    data = b""
+    except OSError:
+        return ""
+    text = data.decode("latin-1", "replace").strip()
+    line = text.splitlines()[0] if text else ""
+    return line[:80]
+
+
 def parse_ports(args):
     """Turn ['22', '80', '20-25'] into a sorted, de-duplicated list of ports.
 
@@ -96,14 +138,14 @@ def connect_scan_port(host, port):
             return f"error: {e}"
 
 
-def connect_scan(host, ports, verbose=False):
+def connect_scan(host, ports, verbose=False, banner=False):
     try:
         target_ip = socket.gethostbyname(host)
     except socket.gaierror as e:
         print(f"Cannot resolve {host}: {e}")
         return
     print(f"Connect scan of {host} ({target_ip}) - {len(ports)} port(s)")
-    _run_pool(connect_scan_port, host, ports, verbose)
+    _run_pool(connect_scan_port, host, ports, verbose, banner)
 
 
 # --------------------------------------------------------------------------- #
@@ -148,7 +190,7 @@ def build_tcp_header(source_ip, dest_ip, source_port, dest_port, flags):
                        tcp_window, tcp_check, tcp_urg_ptr)
 
 
-def raw_scan(host, ports, flags, interpret, verbose=False):
+def raw_scan(host, ports, flags, interpret, verbose=False, banner=False):
     """Send one crafted TCP packet per port and read replies on a shared
     IPPROTO_TCP socket, matching them back to the port by src/dst.
 
@@ -219,7 +261,7 @@ def raw_scan(host, ports, flags, interpret, verbose=False):
 
     for port in ports:
         results.setdefault(port, "open|filtered")
-    _report(results, verbose)
+    _report(host, results, verbose, banner)
 
 
 def syn_interpret(tcp_flags):
@@ -296,22 +338,28 @@ def icmp_ping(host):
 # Shared helpers                                                              #
 # --------------------------------------------------------------------------- #
 
-def _run_pool(scan_fn, host, ports, verbose):
+def _run_pool(scan_fn, host, ports, verbose, banner=False):
     results = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {pool.submit(scan_fn, host, p): p for p in ports}
         for fut in as_completed(futures):
             results[futures[fut]] = fut.result()
-    _report(results, verbose)
+    _report(host, results, verbose, banner)
 
 
-def _report(results, verbose):
+def _report(host, results, verbose, banner=False):
     shown = 0
     for port in sorted(results):
         state = results[port]
-        if verbose or state == "open" or state.startswith("error"):
-            print(f"Port {port:>5}: {state}")
-            shown += 1
+        if not (verbose or state == "open" or state.startswith("error")):
+            continue
+        line = f"Port {port:>5}: {state:<12} {service_name(port)}"
+        if banner and state == "open":
+            b = grab_banner(host, port)
+            if b:
+                line += f"  | {b}"
+        print(line)
+        shown += 1
     open_count = sum(1 for s in results.values() if s == "open")
     if not verbose and shown == 0:
         print("No open ports found (use 'verbose on' to see all states).")
@@ -337,6 +385,7 @@ Usage:
   - 'xmas <host> <ports>'
   - 'ping <host>'
   - 'verbose on|off'  to show closed/filtered ports too
+  - 'banner on|off'   to grab a service banner from open ports
   - 'exit' to quit
 ================================================================================
     """ + RESET
@@ -345,6 +394,7 @@ Usage:
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self.verbose = False
+        self.banner = False
 
     def _ports(self, args):
         try:
@@ -361,7 +411,7 @@ Usage:
             return
         ports = self._ports(args[1:])
         if ports:
-            raw_scan(args[0], ports, 0x02, syn_interpret, self.verbose)
+            raw_scan(args[0], ports, 0x02, syn_interpret, self.verbose, self.banner)
 
     def do_connect(self, arg):
         'TCP connect scan (no root needed): connect <host> <ports>'
@@ -371,7 +421,7 @@ Usage:
             return
         ports = self._ports(args[1:])
         if ports:
-            connect_scan(args[0], ports, self.verbose)
+            connect_scan(args[0], ports, self.verbose, self.banner)
 
     def do_xmas(self, arg):
         'Raw XMAS scan (FIN+PSH+URG): xmas <host> <ports>   (needs root)'
@@ -381,7 +431,7 @@ Usage:
             return
         ports = self._ports(args[1:])
         if ports:
-            raw_scan(args[0], ports, 0x29, xmas_interpret, self.verbose)
+            raw_scan(args[0], ports, 0x29, xmas_interpret, self.verbose, self.banner)
 
     def do_ping(self, arg):
         'Ping a host with ICMP echo: ping <host>   (needs root)'
@@ -398,6 +448,15 @@ Usage:
         elif val in ("off", "false", "0"):
             self.verbose = False
         print(f"verbose = {self.verbose}")
+
+    def do_banner(self, arg):
+        'Grab a service banner from each open port: banner on|off'
+        val = arg.strip().lower()
+        if val in ("on", "true", "1"):
+            self.banner = True
+        elif val in ("off", "false", "0"):
+            self.banner = False
+        print(f"banner = {self.banner}")
 
     def do_exit(self, arg):
         'Exit the scanner'

@@ -8,6 +8,7 @@ SXP Scanner is a lightweight, multi-threaded network scanner that supports SYN, 
 - **Connect Scan**: Full TCP `connect()` handshake. Needs no privileges, but is logged by the target.
 - **XMAS Scan**: Sends FIN + PSH + URG. A RST reply means closed; silence means open or filtered (per RFC 793).
 - **ICMP Ping**: Sends an ICMP Echo request and reports round-trip time.
+- **Service detection**: open ports are labelled with their well-known service name (from the system services database). With `banner on`, SXP also connects to each open port and grabs the service banner (SSH/FTP/SMTP greetings, HTTP response line, etc.).
 - Multi-threaded with a bounded thread pool, so large port ranges won't exhaust file descriptors.
 - `verbose` toggle to show closed/filtered ports in addition to open ones.
 
@@ -56,6 +57,7 @@ connect scanme.nmap.org 1-1024
 xmas    scanme.nmap.org 22 80 443
 ping    scanme.nmap.org
 verbose on        # also show closed/filtered ports
+banner  on        # grab service banners from open ports
 exit
 ```
 
@@ -66,6 +68,7 @@ exit
 | `xmas <host> <ports>`    | FIN+PSH+URG scan            | yes |
 | `ping <host>`            | ICMP echo / RTT             | yes |
 | `verbose on\|off`        | Show all port states        | —   |
+| `banner on\|off`         | Grab banners from open ports | —  |
 
 ## Notes
 
