@@ -14,6 +14,7 @@ SXP Scanner is a lightweight, multi-threaded network scanner (SYN, XMAS, TCP con
   - Extracts the TLS certificate even with verification off (subject/issuer/SAN/validity, self-signed flag) plus the negotiated TLS version and cipher.
   - Runs an **unmasking engine**: flags a fake Cloudflare (no `cf-ray` header, non-public-CA or self-signed cert), reads the server's native error page (`<center>nginx</center>`, `Apache/`, `LiteSpeed`, …), and prints a verdict such as `[!] SPOOFED: claims 'cloudflare' -> likely 'nginx'`.
   - Still grabs plain banners from greeting services (SSH/FTP/SMTP).
+- **WAF / CDN detection** (`waf <host> <port>`): an L7 probe that sends a benign baseline plus attack-pattern requests (SQLi, XSS, LFI, RCE, hostile User-Agent) and compares the responses. Reports whether a WAF blocks the attacks, fingerprints the vendor from headers/cookies/block pages (Cloudflare, Imperva, Akamai, Sucuri, AWS WAF, F5, Barracuda, FortiWeb, ModSecurity, …), and flags a spoofed `Server: cloudflare` with no `cf-ray`.
 - **Self-update**: SXP checks for a newer version on startup and can update itself in place with the `update` command.
 - Multi-threaded with a bounded thread pool (scans and fingerprinting), so large port ranges won't exhaust file descriptors.
 - `verbose` shows closed/filtered ports and, with `banner on`, the full evidence list, header dump, and certificate detail behind each verdict.
@@ -75,6 +76,7 @@ exit
 | `ping <host>`            | ICMP echo / RTT             | yes |
 | `verbose on\|off`        | Show all port states        | —   |
 | `banner on\|off`         | Fingerprint & unmask open ports | —  |
+| `waf <host> <port>`      | Probe a web port for a WAF/CDN (L7) | no |
 | `update`                 | Install the latest version   | yes* |
 
 \* `update` needs write access to the installed script, so run it under `sudo` (the `sxp` launcher already re-execs as root). It downloads `sxp.py` from the repo and swaps it in atomically; restart SXP afterwards. A newer version is also announced automatically at startup. Set `SXP_NO_UPDATE_CHECK=1` to silence that check.
