@@ -9,6 +9,7 @@ SXP Scanner is a lightweight, multi-threaded network scanner that supports SYN, 
 - **XMAS Scan**: Sends FIN + PSH + URG. A RST reply means closed; silence means open or filtered (per RFC 793).
 - **ICMP Ping**: Sends an ICMP Echo request and reports round-trip time.
 - **Service detection**: open ports are labelled with their well-known service name (from the system services database). With `banner on`, SXP also connects to each open port and grabs the service banner (SSH/FTP/SMTP greetings, HTTP response line, etc.).
+- **Self-update**: SXP checks for a newer version on startup and can update itself in place with the `update` command.
 - Multi-threaded with a bounded thread pool, so large port ranges won't exhaust file descriptors.
 - `verbose` toggle to show closed/filtered ports in addition to open ones.
 
@@ -69,6 +70,9 @@ exit
 | `ping <host>`            | ICMP echo / RTT             | yes |
 | `verbose on\|off`        | Show all port states        | —   |
 | `banner on\|off`         | Grab banners from open ports | —  |
+| `update`                 | Install the latest version   | yes* |
+
+\* `update` needs write access to the installed script, so run it under `sudo` (the `sxp` launcher already re-execs as root). It downloads `sxp.py` from the repo and swaps it in atomically; restart SXP afterwards. A newer version is also announced automatically at startup. Set `SXP_NO_UPDATE_CHECK=1` to silence that check.
 
 ## Notes
 

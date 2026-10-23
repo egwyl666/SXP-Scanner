@@ -1,7 +1,13 @@
 import cmd
+import hashlib
+import os
+import re
 import socket
 import struct
+import tempfile
+import threading
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 RED = "\033[31m"
@@ -10,6 +16,15 @@ BLUE = "\033[34m"
 RESET = "\033[0m"
 
 MAX_WORKERS = 200
+
+VERSION = "1.1"
+# Where `update` pulls a fresh sxp.py from. Both are overridable via env
+# so a fork or a local mirror can be used for testing.
+UPDATE_BASE = os.environ.get(
+    "SXP_UPDATE_BASE",
+    "https://raw.githubusercontent.com/egwyl666/SXP-Scanner")
+UPDATE_BRANCH = os.environ.get("SXP_BRANCH", "work/fixit1.0")
+UPDATE_URL = f"{UPDATE_BASE}/{UPDATE_BRANCH}/sxp.py"
 
 LOGO = RED + r"""
 ███████╗██╗  ██╗██████╗
@@ -368,6 +383,76 @@ def _report(host, results, verbose, banner=False):
 
 
 # --------------------------------------------------------------------------- #
+# Self-update                                                                 #
+# --------------------------------------------------------------------------- #
+
+def fetch_latest(timeout=10):
+    """Download the latest sxp.py. Returns its bytes, or None on failure."""
+    try:
+        req = urllib.request.Request(
+            UPDATE_URL, headers={"User-Agent": f"sxp-scanner/{VERSION}"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except Exception:
+        return None
+
+
+def remote_version(remote_bytes):
+    m = re.search(rb'^VERSION = "([^"]+)"', remote_bytes, re.MULTILINE)
+    return m.group(1).decode() if m else "?"
+
+
+def update_available(remote_bytes):
+    """True if the remote copy differs from the file we are running."""
+    try:
+        with open(os.path.abspath(__file__), "rb") as f:
+            local = f.read()
+    except OSError:
+        return False
+    return hashlib.sha256(remote_bytes).digest() != hashlib.sha256(local).digest()
+
+
+def self_update():
+    """Replace the running sxp.py with the latest copy from the repo."""
+    print(f"Checking {UPDATE_URL} ...")
+    remote = fetch_latest()
+    if remote is None:
+        print("Update check failed (network error or file not reachable).")
+        return
+    if not update_available(remote):
+        print(f"Already up to date (version {VERSION}).")
+        return
+
+    rv = remote_version(remote)
+    print(f"Update available: {VERSION} -> {rv}")
+    path = os.path.abspath(__file__)
+    try:
+        # Write to a temp file in the same dir, then atomically swap it in,
+        # so a half-written download can never corrupt the installed script.
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+        with os.fdopen(fd, "wb") as f:
+            f.write(remote)
+        os.chmod(tmp, os.stat(path).st_mode)
+        os.replace(tmp, path)
+    except PermissionError:
+        print(f"Cannot write {path}: permission denied. Re-run with sudo "
+              f"(or: sudo sxp, then 'update').")
+        return
+    except OSError as e:
+        print(f"Update failed: {e}")
+        return
+    print("Updated successfully. Restart sxp to run the new version.")
+
+
+def startup_update_check():
+    """Non-blocking: print a one-line notice if a newer version exists."""
+    remote = fetch_latest(timeout=4)
+    if remote is not None and update_available(remote):
+        print(f"{GREEN}[*] Update available: {VERSION} -> "
+              f"{remote_version(remote)}. Type 'update' to install.{RESET}")
+
+
+# --------------------------------------------------------------------------- #
 # CLI                                                                         #
 # --------------------------------------------------------------------------- #
 
@@ -387,6 +472,7 @@ Usage:
   - 'ping <host>'
   - 'verbose on|off'  to show closed/filtered ports too
   - 'banner on|off'   to grab a service banner from open ports
+  - 'update'  to download and install the latest version
   - 'exit' to quit
 ================================================================================
     """ + RESET
@@ -459,6 +545,10 @@ Usage:
             self.banner = False
         print(f"banner = {self.banner}")
 
+    def do_update(self, arg):
+        'Download and install the latest version: update'
+        self_update()
+
     def do_exit(self, arg):
         'Exit the scanner'
         print("GG")
@@ -469,6 +559,9 @@ Usage:
 
 if __name__ == "__main__":
     print(LOGO)
+    # Check for a newer version in the background so it never delays startup.
+    if os.environ.get("SXP_NO_UPDATE_CHECK") != "1":
+        threading.Thread(target=startup_update_check, daemon=True).start()
     try:
         PortScanner().cmdloop()
     except KeyboardInterrupt:
