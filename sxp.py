@@ -326,8 +326,9 @@ def icmp_ping(host):
                 '!BBHHH', data[ihl:ihl + 8])
             if icmp_type == 0 and reply_id == packet_id:
                 rtt = (time.time() - start) * 1000
+                ttl = data[8]               # TTL byte in the reply's IP header
                 print(f"Reply from {addr[0]}: {len(data)} bytes, "
-                      f"RTT {rtt:.2f} ms")
+                      f"ttl={ttl}, RTT {rtt:.2f} ms")
                 return
         print(f"No reply from {host} (timed out)")
     finally:
