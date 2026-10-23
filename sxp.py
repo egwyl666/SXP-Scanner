@@ -395,6 +395,18 @@ def extract_cert_info(sslsock):
     return info
 
 
+def _cert_validity_days(cert):
+    """Lifetime of the cert in days, or None if the dates can't be parsed."""
+    if not cert.not_before or not cert.not_after:
+        return None
+    try:
+        nb = ssl.cert_time_to_seconds(cert.not_before)
+        na = ssl.cert_time_to_seconds(cert.not_after)
+    except (ValueError, OSError):
+        return None
+    return int((na - nb) / 86400)
+
+
 def _cert_is_private(cert):
     """True if the cert is self-signed or from a non-public / internal CA."""
     if cert.self_signed:
@@ -556,6 +568,23 @@ def _unmask(fp, host, port, use_tls):
             fp.evidence.append(Evidence(
                 4, f"TLS certificate is not from a public CDN CA "
                    f"(issuer={issuer}{extra})"))
+
+    # Certificate lifetime: since 2020 public CAs issue certs valid for at
+    # most ~398 days, so anything much longer is an internal / self CA.
+    if fp.cert:
+        days = _cert_validity_days(fp.cert)
+        if days and days > 398:
+            fp.evidence.append(Evidence(
+                2, f"TLS certificate valid for {days} days (> 398); public "
+                   f"CAs no longer issue certificates this long "
+                   f"(internal / self-signed CA)"))
+
+    # A CDN that answers over plaintext HTTP is a contradiction in itself:
+    # a real Cloudflare edge terminates TLS and never serves bare HTTP here.
+    if "cloudflare" in server_family and fp.transport == "TCP":
+        fp.evidence.append(Evidence(
+            3, "Server claims Cloudflare but answers over plaintext HTTP "
+               "(a real Cloudflare edge terminates TLS)"))
 
     # Verdict: pick the highest-weight evidence that names a service.
     best = max((e for e in fp.evidence if e.inferred_service),
