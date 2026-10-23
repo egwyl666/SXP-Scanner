@@ -93,6 +93,31 @@ def _is_ip(value):
         return False
 
 
+def analyze_ttl(ttl):
+    """Infer the sender's initial TTL, OS family and hop distance."""
+    if ttl is None:
+        return {}
+    if ttl <= 64:
+        initial, os_guess = 64, "Linux/Unix/FW"
+    elif ttl <= 128:
+        initial, os_guess = 128, "Windows"
+    else:
+        initial, os_guess = 255, "net-gear/BSD/Solaris"
+    return {"ttl": ttl, "initial_ttl": initial,
+            "os_guess": os_guess, "hops": initial - ttl}
+
+
+_TTL_SHORT = {"Windows": "win?", "Linux/Unix/FW": "nix?",
+              "net-gear/BSD/Solaris": "net?"}
+
+
+def _ttl_tag(ttl):
+    a = analyze_ttl(ttl)
+    if not a:
+        return ""
+    return f"ttl={ttl} ({_TTL_SHORT[a['os_guess']]}, ~{a['hops']} hops)"
+
+
 def service_name(port):
     """Well-known service name for a port, from the system services DB."""
     for proto in ("tcp", "udp"):
@@ -462,6 +487,8 @@ PLAINTEXT_HTTP_PORTS = {80, 81, 591, 8000, 8008, 8080, 8081, 8888, 2052, 2082,
                         2086, 2095, 8880}
 SPOOF_PRONE = {"cloudflare", "apache", "iis", "microsoft-iis", "gws",
                "openresty"}
+# Status codes that mean "request denied" rather than "normal content".
+LOCKDOWN_CODES = {401, 403, 406, 429, 444, 503}
 PUBLIC_CA_HINTS = ("cloudflare", "google trust", "digicert", "lets encrypt",
                    "let's encrypt", "amazon", "sectigo", "globalsign",
                    "baltimore", "isrg")
@@ -525,6 +552,8 @@ class Fingerprint:
     evidence: List[Evidence] = field(default_factory=list)
     inferred_service: str = ""
     spoofed: bool = False
+    tcpwrapped: bool = False
+    baseline_note: str = ""
     error: str = ""
 
 
@@ -696,11 +725,15 @@ def _rand_path():
 # --- transport decision + probe pipeline ------------------------------------ #
 
 def _plaintext_probe(host, port, timeout):
-    """Returns (http_bytes, greeting_or_None, tls_hint, nginx_https)."""
+    """Returns (http_bytes, greeting_or_None, tls_hint, nginx_https, got_bytes).
+
+    got_bytes is True if the server sent anything at all over plaintext; a
+    connected-but-silent port (got_bytes False) is a tcpwrapped candidate.
+    """
     try:
         sock = _open_socket(host, port, False, timeout)
     except OSError:
-        return b"", None, False, False
+        return b"", None, False, False, False
     try:
         sock.settimeout(0.8)
         try:
@@ -716,12 +749,12 @@ def _plaintext_probe(host, port, timeout):
                               greet.decode("latin-1", "replace").splitlines()
                               if l.strip()), "")
                 if first:
-                    return b"", first.strip()[:120], False, False
+                    return b"", first.strip()[:120], False, False, True
             if is_http:
                 rest = _recv_all(sock, READ_LIMIT - len(greet))
-                return greet + rest, None, False, False
+                return greet + rest, None, False, False, True
             if is_tls:
-                return greet, None, True, False
+                return greet, None, True, False, True
         try:
             sock.sendall(_http_get_probe(host))
             data = _recv_all(sock)
@@ -733,23 +766,28 @@ def _plaintext_probe(host, port, timeout):
     nginx_sig = b"plain HTTP request was sent to HTTPS port" in data
     tls_hint = (_looks_like_tls(data) or nginx_sig
                 or (not data and port not in PLAINTEXT_HTTP_PORTS))
-    return data, None, tls_hint, nginx_sig
+    return data, None, tls_hint, nginx_sig, bool(data)
 
 
 def _decide_transport(ip, port, timeout):
-    """Returns (use_tls, raw_banner_or_None, nginx_https_marker)."""
+    """Returns (use_tls, raw_banner_or_None, nginx_https_marker, plaintext_bytes).
+
+    plaintext_bytes is None for assumed-TLS ports (not probed in plaintext),
+    else whether the plaintext probe received any data."""
     if port in TLS_PORTS:
-        return True, None, False
-    _, greeting, tls_hint, nginx_sig = _plaintext_probe(ip, port, timeout)
+        return True, None, False, None
+    _, greeting, tls_hint, nginx_sig, got_bytes = _plaintext_probe(
+        ip, port, timeout)
     if greeting is not None:
-        return False, greeting, False
-    return bool(tls_hint), None, nginx_sig
+        return False, greeting, False, True
+    return bool(tls_hint), None, nginx_sig, got_bytes
 
 
 def fingerprint_port(ip, hostname, port, path="/", timeout=SOCKET_TIMEOUT):
     """Smart multi-probe fingerprint + unmasking for one open TCP port."""
     fp = Fingerprint(port=port)
-    use_tls, raw_banner, nginx_marker = _decide_transport(ip, port, timeout)
+    use_tls, raw_banner, nginx_marker, plaintext_bytes = _decide_transport(
+        ip, port, timeout)
     if raw_banner is not None:
         fp.raw_banner = raw_banner
         return fp
@@ -780,6 +818,7 @@ def fingerprint_port(ip, hostname, port, path="/", timeout=SOCKET_TIMEOUT):
                "'The plain HTTP request was sent to HTTPS port'", "nginx"))
 
     bodies = [("main", fp.body_snippet)]
+    probe_codes = [resp.code]
 
     if fp.http_status:
         # Probe 2: OPTIONS to read Allow / Public.
@@ -787,11 +826,13 @@ def fingerprint_port(ip, hostname, port, path="/", timeout=SOCKET_TIMEOUT):
                            method="OPTIONS", timeout=timeout)
         fp.allow = opt.headers_lower.get("allow", "") or \
             opt.headers_lower.get("public", "")
+        probe_codes.append(opt.code)
         # Probe 3: random path -> native 404, often reveals the real engine.
         nf = http_request(ip, port, use_tls, hostname, _rand_path(),
                           timeout=timeout)
         fp.notfound_status = nf.status
         bodies.append(("404", nf.body))
+        probe_codes.append(nf.code)
         if nf.server and _family(nf.server) and _family(nf.server) != _family(fp.server_header):
             fp.evidence.append(Evidence(
                 3, f"404 Server header '{nf.server}' differs from main "
@@ -800,8 +841,29 @@ def fingerprint_port(ip, hostname, port, path="/", timeout=SOCKET_TIMEOUT):
         err = http_request(ip, port, use_tls, hostname, "/", http10=True,
                            send_host=False, timeout=timeout)
         bodies.append(("error", err.body))
+        probe_codes.append(err.code)
 
     _unmask(fp, bodies)
+
+    # Task 4: uniform lockdown note. All probes returned the same block code
+    # with no engine signature -> a custom error_page / strict access policy.
+    answered = [c for c in probe_codes if c]
+    if (fp.http_status and len(answered) >= 2
+            and len(set(answered)) == 1
+            and answered[0] in LOCKDOWN_CODES
+            and not any(e.inferred_service for e in fp.evidence)):
+        fp.baseline_note = (f"Uniform HTTP {answered[0]} across all probes "
+                            f"(custom error_page / strict access policy)")
+
+    # Task 3: tcpwrapped. The port is open (we only fingerprint open ports) but
+    # spoke nothing over plaintext and TLS gave no usable response or banner.
+    spoke = bool(fp.http_status or (fp.raw_banner and not fp.tcpwrapped)
+                 or fp.cert or fp.evidence)
+    if not spoke and plaintext_bytes is False:
+        fp.tcpwrapped = True
+        fp.raw_banner = ("tcpwrapped (connection closed immediately after "
+                         "handshake — likely firewall/TCP wrapper or a port "
+                         "forwarder with a dead backend)")
     return fp
 
 
@@ -896,6 +958,8 @@ def fingerprint_lines(fp, verbose):
             line += f"   (identified: {fp.inferred_service})"
         out.append(line)
 
+    if fp.baseline_note:
+        out.append(f"        {YELLOW}[*] {fp.baseline_note}{RESET}")
     if fp.redirect_chain:
         hop = " -> ".join(f"{c}:{loc}" for c, loc in fp.redirect_chain)
         out.append(f"        redirect: {hop}")
@@ -943,10 +1007,41 @@ PANEL_SINGLE = {
 }
 
 
-def host_intel(open_ports, fps):
+def host_intel(open_ports, fps, ttls=None, ping_ttl=None):
     """Infrastructure insights from the open-port layout + fingerprints."""
     out = []
     op = set(open_ports)
+    ttls = ttls or {}
+
+    # Task 2: split network stack / DNAT. Group open ports by (initial_ttl,
+    # hops); more than one profile means different devices answer different
+    # ports (an intermediate firewall/proxy, or forwarding to several backends).
+    groups = {}
+    for port in open_ports:
+        info = analyze_ttl(ttls.get(port))
+        if info:
+            key = (info["initial_ttl"], info["hops"])
+            groups.setdefault(key, []).append(port)
+    if ping_ttl is not None:
+        pinfo = analyze_ttl(ping_ttl)
+        if pinfo:
+            groups.setdefault((pinfo["initial_ttl"], pinfo["hops"]), [])
+    if len(groups) >= 2:
+        parts = []
+        for (initial, hops), plist in sorted(groups.items()):
+            tag = _TTL_SHORT.get(analyze_ttl(initial)["os_guess"], "?")
+            where = (", ".join(map(str, sorted(plist))) if plist
+                     else "ICMP echo")
+            parts.append(f"TTL~{initial - hops} [{tag}, ~{hops} hops] on {where}")
+        out.append(f"{RED}[!] Split Network Stack / DNAT Detected: ports "
+                   f"respond with different TTL profiles ({'; '.join(parts)}). "
+                   f"Traffic is partially terminated by an intermediate "
+                   f"firewall/proxy or forwarded to different backends.{RESET}")
+
+    wrapped = sorted(p for p, f in fps.items() if getattr(f, "tcpwrapped", False))
+    if wrapped:
+        out.append(f"tcpwrapped ports (firewall/dead backend): "
+                   f"{', '.join(map(str, wrapped))}")
 
     panels = [name for pair, name in CPANEL_PAIRS if op & set(pair)]
     if panels:
@@ -1040,8 +1135,9 @@ def xmas_interpret(tcp_flags):
 def raw_scan(ip, host_label, ports, flags, interpret, default_state, timeout=2.0):
     """Two-pass SYN/XMAS scan with port shuffling and a retransmit pass.
 
-    Returns {port: state}. No reply after both passes becomes `default_state`
-    (filtered for SYN, open|filtered for XMAS).
+    Returns (results, ttls, source_ip). No reply after both passes becomes
+    `default_state` (filtered for SYN, open|filtered for XMAS). `ttls` maps a
+    port to the TTL of its reply's IPv4 header (per-port, for host analysis).
     """
     source_ip = get_source_ip(ip)
     try:
@@ -1052,7 +1148,7 @@ def raw_scan(ip, host_label, ports, flags, interpret, default_state, timeout=2.0
                                   socket.IPPROTO_TCP)
     except PermissionError:
         print("Raw sockets need root. Try: sudo python3 sxp.py")
-        return None, source_ip
+        return None, {}, source_ip
 
     # Shuffle so we don't hammer a firewall's rate-limit in port order.
     order = list(ports)
@@ -1060,6 +1156,7 @@ def raw_scan(ip, host_label, ports, flags, interpret, default_state, timeout=2.0
     sport_of = {(40000 + i) % 65536 or 1: p for i, p in enumerate(order)}
     port_sport = {p: s for s, p in sport_of.items()}
     results = {}
+    ttls = {}
 
     def send(targets):
         for p in targets:
@@ -1089,8 +1186,10 @@ def raw_scan(ip, host_label, ports, flags, interpret, default_state, timeout=2.0
                 continue
             state = interpret(data[ihl + 13])
             if state is not None:
-                results[sport_of[dst_port]] = state
-                pending.discard(sport_of[dst_port])
+                port = sport_of[dst_port]
+                results[port] = state
+                ttls[port] = data[8]          # TTL from the reply's IP header
+                pending.discard(port)
 
     pending = set(p for p in ports if p not in results)
     send(pending)
@@ -1105,7 +1204,7 @@ def raw_scan(ip, host_label, ports, flags, interpret, default_state, timeout=2.0
     recv_sock.close()
     for p in ports:
         results.setdefault(p, default_state)
-    return results, source_ip
+    return results, ttls, source_ip
 
 
 # --------------------------------------------------------------------------- #
@@ -1121,11 +1220,12 @@ def create_icmp_packet(packet_id):
 
 
 def icmp_ping(host):
+    """Send one ICMP echo. Returns (ip, ttl) on reply, else (ip, None)."""
     try:
         target_ip = socket.gethostbyname(host)
     except socket.gaierror as e:
         print(f"Cannot resolve {host}: {e}")
-        return
+        return None, None
     packet_id = int(time.time() * 1000) & 0xffff
     packet = create_icmp_packet(packet_id)
     try:
@@ -1133,7 +1233,7 @@ def icmp_ping(host):
                              socket.IPPROTO_ICMP)
     except PermissionError:
         print("ICMP ping needs root. Try: sudo python3 sxp.py")
-        return
+        return target_ip, None
     try:
         start = time.time()
         sock.sendto(packet, (target_ip, 0))
@@ -1152,12 +1252,14 @@ def icmp_ping(host):
             if icmp_type == 0 and reply_id == packet_id:
                 rtt = (time.time() - start) * 1000
                 ttl = data[8]
+                tag = _ttl_tag(ttl)
                 print(f"Reply from {addr[0]}: {len(data)} bytes, "
-                      f"ttl={ttl}, RTT {rtt:.2f} ms")
-                return
+                      f"{tag}, RTT {rtt:.2f} ms")
+                return target_ip, ttl
         print(f"No reply from {host} (timed out)")
     finally:
         sock.close()
+    return target_ip, None
 
 
 # --------------------------------------------------------------------------- #
@@ -1183,7 +1285,8 @@ def _fingerprint_open(ip, hostname, open_ports):
     return fps
 
 
-def _emit_scan(spec, results, fps, elapsed, scan_type, verbose):
+def _emit_scan(spec, results, fps, ttls, elapsed, scan_type, verbose,
+               ping_ttl=None):
     """Print a scan report and return a JSON-able structure of it."""
     open_ports = sorted(p for p in results if results[p] == "open")
     struct_ports = []
@@ -1197,21 +1300,28 @@ def _emit_scan(spec, results, fps, elapsed, scan_type, verbose):
             entry["service"] = service_name(port)
         else:
             entry["port_hint"] = service_name(port)
+        info = analyze_ttl(ttls.get(port))
+        if info:
+            entry.update({"ttl": info["ttl"], "initial_ttl": info["initial_ttl"],
+                          "hops": info["hops"], "os_guess": info["os_guess"]})
         if is_open and port in fps:
             entry["fingerprint"] = asdict(fps[port])
         struct_ports.append(entry)
 
         if not (verbose or is_open or is_err):
             continue
+        ttag = _ttl_tag(ttls.get(port))
+        ttl_txt = f"  {ttag}" if ttag else ""
         if is_open:
-            print(f"Port {port:>5}: {GREEN}open{RESET}         {service_name(port)}")
-            for line in fingerprint_lines(fps.get(port, Fingerprint(port=port)),
-                                          verbose):
-                print(line)
+            print(f"Port {port:>5}: {GREEN}open{RESET}         "
+                  f"{service_name(port)}{ttl_txt}")
+            if port in fps:
+                for line in fingerprint_lines(fps[port], verbose):
+                    print(line)
         else:
             hint = service_name(port)
             hint_txt = f"  (port-hint: {hint})" if hint != "unknown" else ""
-            print(f"Port {port:>5}: {state}{hint_txt}")
+            print(f"Port {port:>5}: {state}{hint_txt}{ttl_txt}")
 
     # Summary footer.
     total = len(results)
@@ -1229,7 +1339,7 @@ def _emit_scan(spec, results, fps, elapsed, scan_type, verbose):
                f"{err_txt}{tail}")
     print(summary)
 
-    insights = host_intel(open_ports, fps)
+    insights = host_intel(open_ports, fps, ttls, ping_ttl)
     for line in insights:
         print(f"  {line}")
 
@@ -1244,12 +1354,13 @@ def _emit_scan(spec, results, fps, elapsed, scan_type, verbose):
     }
 
 
-def run_scan(spec, scan_type, verbose, banner):
+def run_scan(spec, scan_type, verbose, banner, ping_ttl=None):
     """Drive a syn/xmas/connect scan and print + return structured results."""
     ip, label = spec.ip, spec.hostname
     print(f"{scan_type.upper()} scan of {label} ({ip}) - "
           f"{len(spec.ports)} port(s)")
     start = time.time()
+    ttls = {}
 
     if scan_type == "connect":
         results = {}
@@ -1262,8 +1373,8 @@ def run_scan(spec, scan_type, verbose, banner):
         flags, interp, default_state = (
             (0x02, syn_interpret, "filtered") if scan_type == "syn"
             else (0x29, xmas_interpret, "open|filtered"))
-        results, src = raw_scan(ip, label, spec.ports, flags, interp,
-                                default_state)
+        results, ttls, src = raw_scan(ip, label, spec.ports, flags, interp,
+                                      default_state)
         if results is None:
             return None
         print(f"(source IP {src})")
@@ -1271,7 +1382,8 @@ def run_scan(spec, scan_type, verbose, banner):
     open_ports = sorted(p for p in results if results[p] == "open")
     fps = _fingerprint_open(ip, label, open_ports) if banner else {}
     elapsed = time.time() - start
-    return _emit_scan(spec, results, fps, elapsed, scan_type, verbose)
+    return _emit_scan(spec, results, fps, ttls, elapsed, scan_type, verbose,
+                      ping_ttl)
 
 
 def run_fingerprint(spec, verbose):
@@ -1394,6 +1506,7 @@ class WafResult:
     waf_names: List[str] = field(default_factory=list)
     evidence: List[str] = field(default_factory=list)
     spoof_note: str = ""
+    baseline_lockdown: str = ""
     error: str = ""
 
 
@@ -1443,6 +1556,8 @@ def waf_detect(ip, hostname, port, timeout=SOCKET_TIMEOUT):
         result.challenge = "JS challenge / CAPTCHA page on baseline"
 
     responses = [base]
+    probe_codes = [base_code]
+    probe_lengths = [base.length]
     probes = [(n, p, None) for n, p in WAF_PROBES]
     probes.append(("bad-user-agent", "/", {"User-Agent": WAF_BAD_UA}))
     for name, path, extra in probes:
@@ -1451,6 +1566,8 @@ def waf_detect(ip, hostname, port, timeout=SOCKET_TIMEOUT):
         if not r.code and not r.body:
             continue
         responses.append(r)
+        probe_codes.append(r.code)
+        probe_lengths.append(r.length)
         reason = ""
         if r.code in WAF_BLOCK_CODES and r.code != base_code:
             reason = f"status {base_code}->{r.code}"
@@ -1506,6 +1623,23 @@ def waf_detect(ip, hostname, port, timeout=SOCKET_TIMEOUT):
         names = {n for n in names if not n.startswith("Cloudflare")}
         evidence = {e for e in evidence if "-> Cloudflare" not in e}
 
+    # Task 4: baseline lockdown. Baseline already a deny code and every probe
+    # returned the same code with a similar body size -> the origin denies all
+    # requests, so payload diffing is inconclusive (ACL/mTLS/WAF block-all).
+    answered = [c for c in probe_codes if c]
+    if (base_code in LOCKDOWN_CODES and len(answered) >= 2
+            and len(set(answered)) == 1):
+        lo, hi = min(probe_lengths), max(probe_lengths)
+        if hi == 0 or (hi - lo) <= max(64, hi * 0.1):
+            result.baseline_lockdown = (
+                f"Baseline Lockdown (HTTP {base_code}): origin denies all "
+                f"requests indiscriminately (strict ACL, IP allowlist, mTLS "
+                f"requirement, or WAF in block-all mode). Active payload "
+                f"diffing is inconclusive; relying on passive headers/TLS "
+                f"fingerprint.")
+            # A uniform deny is not an attacker-triggered block.
+            result.blocked = []
+
     result.waf_names = sorted(names)
     result.evidence = sorted(evidence)
     return result
@@ -1522,12 +1656,14 @@ def waf_lines(res):
         out.append(f"  baseline redirect: {res.redirect_note}")
     if res.challenge:
         out.append(f"  {YELLOW}[*] {res.challenge}{RESET}")
+    if res.baseline_lockdown:
+        out.append(f"  {RED}[!] {res.baseline_lockdown}{RESET}")
     if res.waf_names:
         out.append(f"  {RED}[!] WAF/CDN detected: {', '.join(res.waf_names)}{RESET}")
     elif res.blocked:
         out.append(f"  {RED}[!] Generic WAF present: attack patterns are "
                    f"blocked (no vendor fingerprint){RESET}")
-    else:
+    elif not res.baseline_lockdown:
         out.append("  No WAF detected: attack patterns passed through "
                    "(server answered them like normal requests)")
     if res.spoof_note:
@@ -1535,7 +1671,7 @@ def waf_lines(res):
     if res.blocked:
         for name, code, reason in res.blocked:
             out.append(f"  blocked: {name} -> {code} ({reason})")
-    else:
+    elif not res.baseline_lockdown:
         out.append("  blocked: none (SQLi/XSS/LFI/RCE/bad-UA all got through)")
     for e in res.evidence:
         out.append(f"    - {e}")
@@ -1656,6 +1792,7 @@ Targets accept host, host:port or URL (https://site.com:8443/path).
         self.verbose = False
         self.banner = False
         self.last_result = None
+        self.ping_ttls = {}       # ip -> TTL seen from the last ICMP ping
 
     # -- helpers ----------------------------------------------------------- #
 
@@ -1680,7 +1817,8 @@ Targets accept host, host:port or URL (https://site.com:8443/path).
         'Raw SYN scan: syn <target> <ports>   (needs root)'
         spec = self._target(arg, need_ports=True)
         if spec:
-            res = run_scan(spec, "syn", self.verbose, self.banner)
+            res = run_scan(spec, "syn", self.verbose, self.banner,
+                           self.ping_ttls.get(spec.ip))
             if res:
                 self.last_result = res
 
@@ -1688,13 +1826,17 @@ Targets accept host, host:port or URL (https://site.com:8443/path).
         'TCP connect scan: connect <target> <ports>'
         spec = self._target(arg, need_ports=True)
         if spec:
-            self.last_result = run_scan(spec, "connect", self.verbose, self.banner)
+            res = run_scan(spec, "connect", self.verbose, self.banner,
+                           self.ping_ttls.get(spec.ip))
+            if res:
+                self.last_result = res
 
     def do_xmas(self, arg):
         'XMAS scan: xmas <target> <ports>   (needs root)'
         spec = self._target(arg, need_ports=True)
         if spec:
-            res = run_scan(spec, "xmas", self.verbose, self.banner)
+            res = run_scan(spec, "xmas", self.verbose, self.banner,
+                           self.ping_ttls.get(spec.ip))
             if res:
                 self.last_result = res
 
@@ -1717,7 +1859,10 @@ Targets accept host, host:port or URL (https://site.com:8443/path).
         if not arg.strip():
             print("Usage: ping <host>")
             return
-        icmp_ping(arg.strip())
+        ip, ttl = icmp_ping(arg.strip())
+        if ip and ttl is not None:
+            # Remember it so a later scan of the same IP can correlate TTLs.
+            self.ping_ttls[ip] = ttl
 
     # -- toggles / utility ------------------------------------------------- #
 
